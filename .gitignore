@@ -1,0 +1,12 @@
+**/.env
+**/.env.*
+**/*.env
+**/target/
+**/data/
+/.worktrees/
+
+# Local credential sources and generated broker session token.
+/api-keys.txt
+/git and render.txt
+/token.txt
+/totp.txt

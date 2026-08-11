@@ -1,0 +1,10 @@
+/target/
+/data/
+**/.env
+**/.env.*
+**/*.env
+*.log
+api-keys.txt
+git and render.txt
+token.txt
+totp.txt

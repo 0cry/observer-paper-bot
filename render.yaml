@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: observer-paper-bot
+    runtime: docker
+    plan: free
+    region: singapore
+    rootDir: trading set up
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY_1
+        sync: false
+      - key: GEMINI_API_KEY_2
+        sync: false
+      - key: GEMINI_API_KEY_3
+        sync: false
+      - key: ELEVENLABS_API_KEY_1
+        sync: false
+      - key: ELEVENLABS_API_KEY_2
+        sync: false
+      - key: ELEVENLABS_API_KEY_3
+        sync: false
+      - key: BROKER_CLIENT_ID
+        sync: false
+      - key: BROKER_MPIN
+        sync: false
+      - key: BROKER_TOTP_SECRET
+        sync: false
+      - key: YOUTUBE_CHANNEL_URL
+        value: https://www.youtube.com/@TRADINGCAFEINDIA
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash-lite
+      - key: ELEVENLABS_KEY_LIMIT
+        value: "3"
+      - key: YOUTUBE_POLL_SECONDS
+        value: "60"
+      - key: POLL_START_IST
+        value: "09:00:00"
+      - key: LAST_DISCOVERY_IST
+        value: "15:30:00"
+      - key: WORKER_STOP_IST
+        value: "16:00:00"

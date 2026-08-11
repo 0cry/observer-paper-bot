@@ -1,0 +1,16 @@
+.git
+.git/**
+.worktrees
+.worktrees/**
+**/.env
+**/.env.*
+**/*.env
+**/target
+**/target/**
+**/data
+**/data/**
+**/*.log
+api-keys.txt
+git and render.txt
+token.txt
+totp.txt

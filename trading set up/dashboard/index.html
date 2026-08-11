@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#080b12">
+  <meta name="description" content="Real-time paper trading dashboard for the Observer market manager.">
+  <title>Observer Paper Desk</title>
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to dashboard</a>
+
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="Dashboard navigation">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" role="img"><path d="M5 21.5 11.2 15l4.1 3.8L25.8 8.5"/><path d="M21 8.5h4.8v4.8"/></svg>
+        </span>
+        <span><strong>Observer</strong><small>Paper desk</small></span>
+      </div>
+
+      <nav class="primary-nav" aria-label="Primary">
+        <button class="nav-item is-active" type="button" data-view-target="live" aria-current="page">
+          <span class="nav-icon" aria-hidden="true">⌁</span>
+          Live desk
+          <span class="nav-live-dot" aria-label="Live"></span>
+        </button>
+        <button class="nav-item" type="button" data-view-target="history">
+          <span class="nav-icon" aria-hidden="true">≡</span>
+          Trade history
+        </button>
+      </nav>
+
+      <section class="source-status" aria-labelledby="source-status-title">
+        <div class="sidebar-section-title" id="source-status-title">System status</div>
+        <ul>
+          <li><span><i class="status-dot is-muted" id="api-dot"></i>Dashboard API</span><b id="api-label">Checking</b></li>
+          <li><span><i class="status-dot is-muted" id="feed-dot"></i>Market feed</span><b id="feed-label">Unknown</b></li>
+          <li><span><i class="status-dot is-muted" id="stream-dot"></i>Video stream</span><b id="stream-label">Unknown</b></li>
+          <li><span><i class="status-dot is-muted" id="stt-dot"></i>Transcription</span><b id="stt-label">Unknown</b></li>
+          <li><span><i class="status-dot is-muted" id="gemini-dot"></i>Gemini</span><b id="gemini-label">Unknown</b></li>
+        </ul>
+        <div class="api-key-health">
+          <div class="sidebar-section-title">Credential slots</div>
+          <ul id="key-health-list"><li class="key-health-empty">Waiting for runtime</li></ul>
+        </div>
+      </section>
+
+      <div class="sidebar-foot">
+        <span class="shield" aria-hidden="true">✓</span>
+        <span><strong>Paper trading only</strong><small>No broker order routing</small></span>
+      </div>
+    </aside>
+
+    <main class="main" id="main-content">
+      <header class="topbar">
+        <button class="icon-button menu-button" type="button" id="menu-toggle" aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation">☰</button>
+        <div class="topbar-title">
+          <span class="eyebrow" id="session-date">Trading session</span>
+          <h1 id="page-title">Live paper desk</h1>
+        </div>
+        <div class="topbar-actions">
+          <div class="connection-pill is-connecting" id="connection-pill" role="status">
+            <i></i><span>Connecting</span>
+          </div>
+          <time class="clock" id="live-clock" aria-label="Current Indian Standard Time">--:--:-- <small>IST</small></time>
+          <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh dashboard" title="Refresh data">↻</button>
+        </div>
+      </header>
+
+      <div class="offline-banner" id="offline-banner" role="alert" hidden>
+        <span><strong>Live service unavailable.</strong> Showing the last data received by this browser.</span>
+        <button type="button" id="retry-button">Retry now</button>
+      </div>
+
+      <section class="view is-active" id="live-view" data-view="live" aria-labelledby="live-heading">
+        <div class="section-heading live-heading">
+          <div>
+            <div class="heading-line">
+              <h2 id="live-heading">Session overview</h2>
+              <span class="market-pill" id="market-pill">Market —</span>
+            </div>
+            <p>Tick-level paper positions across both exit strategies.</p>
+          </div>
+          <div class="session-meta" aria-label="Session timestamps">
+            <span>Started <strong id="session-started">—</strong></span>
+            <span>Last update <strong id="last-updated">Waiting for data</strong></span>
+            <span>Tick age <strong id="tick-age">—</strong></span>
+          </div>
+        </div>
+
+        <fieldset class="mode-filter" aria-label="Portfolio mode">
+          <legend>Portfolio mode</legend>
+          <label><input type="radio" name="mode" value="all" checked><span>All</span></label>
+          <label><input type="radio" name="mode" value="llm_exit"><span>LLM exit</span></label>
+          <label><input type="radio" name="mode" value="moving_sl"><span>Moving SL</span></label>
+        </fieldset>
+
+        <div class="kpi-grid" aria-live="polite">
+          <article class="kpi-card accent-blue">
+            <div class="kpi-label">Total equity <span class="info" title="Cash plus current position value">i</span></div>
+            <strong id="kpi-equity">₹—</strong>
+            <span class="kpi-detail" id="kpi-equity-detail">Across 5 accounts</span>
+          </article>
+          <article class="kpi-card accent-green">
+            <div class="kpi-label">Realized P&amp;L</div>
+            <strong id="kpi-realized">₹—</strong>
+            <span class="kpi-detail" id="kpi-realized-detail">Closed trades</span>
+          </article>
+          <article class="kpi-card accent-violet">
+            <div class="kpi-label">Unrealized P&amp;L</div>
+            <strong id="kpi-unrealized">₹—</strong>
+            <span class="kpi-detail" id="kpi-unrealized-detail">Mark to market</span>
+          </article>
+          <article class="kpi-card accent-amber">
+            <div class="kpi-label">Open positions</div>
+            <strong id="kpi-positions">—</strong>
+            <span class="kpi-detail" id="kpi-positions-detail">0 pending orders</span>
+          </article>
+          <article class="kpi-card accent-cyan">
+            <div class="kpi-label">Win rate</div>
+            <strong id="kpi-win-rate">—%</strong>
+            <span class="kpi-detail" id="kpi-win-detail">No closed trades</span>
+          </article>
+          <article class="kpi-card accent-red">
+            <div class="kpi-label">Max drawdown</div>
+            <strong id="kpi-drawdown">—%</strong>
+            <span class="kpi-detail" id="kpi-drawdown-detail">Session peak to trough</span>
+          </article>
+        </div>
+
+        <div class="dashboard-grid chart-row">
+          <article class="panel chart-panel">
+            <header class="panel-header">
+              <div><h3>Session performance</h3><p>Equity and cumulative P&amp;L</p></div>
+              <div class="chart-legend" aria-label="Chart legend"><span><i class="line-equity"></i>Equity</span><span><i class="line-pnl"></i>P&amp;L</span></div>
+            </header>
+            <div class="chart-wrap">
+              <canvas id="performance-chart" role="img" aria-label="Equity and profit and loss throughout this trading session"></canvas>
+              <div class="chart-empty" id="chart-empty">Performance appears after the first account snapshot.</div>
+            </div>
+            <p class="sr-only" id="chart-summary">No session performance data is available.</p>
+          </article>
+
+          <article class="panel accounts-panel">
+            <header class="panel-header">
+              <div><h3>Account allocation</h3><p>Cash, margin and mark-to-market</p></div>
+              <span class="panel-count" id="account-count">0 accounts</span>
+            </header>
+            <div class="table-scroll compact-table">
+              <table>
+                <thead><tr><th>Account</th><th class="numeric">Equity</th><th class="numeric">Free</th><th class="numeric">P&amp;L</th><th class="numeric">Used</th></tr></thead>
+                <tbody id="accounts-body"></tbody>
+              </table>
+            </div>
+          </article>
+        </div>
+
+        <article class="panel positions-panel">
+          <header class="panel-header">
+            <div><h3>Live positions</h3><p>Fresh LTP, active risk levels and per-account P&amp;L</p></div>
+            <div class="panel-tools"><span class="pulse-label"><i></i>Tick sync</span><span class="panel-count" id="position-count">0 open</span></div>
+          </header>
+          <div class="table-scroll">
+            <table class="data-table positions-table">
+              <thead>
+                <tr><th>Contract / account</th><th>Mode</th><th class="numeric">Qty</th><th class="numeric">Entry</th><th class="numeric">LTP</th><th class="numeric">SL</th><th class="numeric">T1 / T2</th><th>Phase</th><th class="numeric">P&amp;L</th><th>Opened</th></tr>
+              </thead>
+              <tbody id="positions-body"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <div class="dashboard-grid lower-row">
+          <article class="panel">
+            <header class="panel-header">
+              <div><h3>Pending entries</h3><p>Waiting for buffered limit conditions</p></div>
+              <span class="panel-count" id="pending-count">0 pending</span>
+            </header>
+            <div class="table-scroll compact-table">
+              <table>
+                <thead><tr><th>Contract</th><th class="numeric">Entry cap</th><th class="numeric">LTP</th><th>Accounts</th><th>Age</th></tr></thead>
+                <tbody id="pending-body"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel signals-panel">
+            <header class="panel-header">
+              <div><h3>Gemini signal stream</h3><p>Latest extracted trading decisions</p></div>
+              <span class="panel-count" id="signal-count">0 signals</span>
+            </header>
+            <ol class="signal-timeline" id="signals-list"></ol>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="history-view" data-view="history" aria-labelledby="history-heading" hidden>
+        <div class="section-heading history-heading">
+          <div><h2 id="history-heading">Trade history</h2><p>Audit every simulated fill, exit and strategy outcome.</p></div>
+          <button class="secondary-button" type="button" id="export-button">↓ Export filtered CSV</button>
+        </div>
+
+        <form class="history-filters panel" id="history-filters" role="search">
+          <label class="search-field"><span>Search</span><input type="search" name="q" id="history-search" placeholder="Contract, account or setup ID" autocomplete="off"></label>
+          <label><span>Status</span><select name="status" id="history-status"><option value="">All statuses</option><option value="won">Won</option><option value="lost">Lost</option><option value="breakeven">Breakeven</option><option value="open">Open</option><option value="cancelled">Cancelled</option></select></label>
+          <label><span>Mode</span><select name="mode" id="history-mode"><option value="">All modes</option><option value="llm_exit">LLM exit</option><option value="moving_sl">Moving SL</option></select></label>
+          <label><span>Account</span><select name="account" id="history-account"><option value="">All accounts</option></select></label>
+          <label><span>Underlying</span><select name="underlying" id="history-underlying"><option value="">All underlyings</option><option value="NIFTY">NIFTY</option><option value="SENSEX">SENSEX</option></select></label>
+          <label><span>From</span><input type="date" name="from" id="history-from"></label>
+          <label><span>To</span><input type="date" name="to" id="history-to"></label>
+          <button class="quiet-button" type="reset" id="clear-filters">Clear filters</button>
+        </form>
+
+        <div class="history-stats" aria-live="polite">
+          <span><strong id="history-total">0</strong> trades</span>
+          <span>Net P&amp;L <strong id="history-net">₹0.00</strong></span>
+          <span>Wins / losses <strong id="history-record">0 / 0</strong></span>
+          <span>Avg. trade <strong id="history-average">₹0.00</strong></span>
+        </div>
+
+        <article class="panel history-panel">
+          <div class="table-scroll">
+            <table class="data-table history-table">
+              <thead>
+                <tr>
+                  <th><button type="button" data-sort="closed_at">Exit time <span>↕</span></button></th>
+                  <th><button type="button" data-sort="contract">Contract <span>↕</span></button></th>
+                  <th><button type="button" data-sort="account">Account <span>↕</span></button></th>
+                  <th><button type="button" data-sort="mode">Mode <span>↕</span></button></th>
+                  <th class="numeric"><button type="button" data-sort="quantity">Qty <span>↕</span></button></th>
+                  <th class="numeric"><button type="button" data-sort="entry_price">Entry <span>↕</span></button></th>
+                  <th class="numeric"><button type="button" data-sort="exit_price">Exit <span>↕</span></button></th>
+                  <th><button type="button" data-sort="exit_reason">Exit reason <span>↕</span></button></th>
+                  <th class="numeric"><button type="button" data-sort="realized_pnl">Net P&amp;L <span>↕</span></button></th>
+                  <th><button type="button" data-sort="duration_seconds">Duration <span>↕</span></button></th>
+                  <th>Status</th><th><span class="sr-only">Details</span></th>
+                </tr>
+              </thead>
+              <tbody id="history-body"></tbody>
+            </table>
+          </div>
+          <footer class="pagination">
+            <span id="page-summary">No trades</span>
+            <div>
+              <label>Rows <select id="page-size" aria-label="Rows per page"><option>10</option><option selected>25</option><option>50</option><option>100</option></select></label>
+              <button type="button" class="icon-button" id="previous-page" aria-label="Previous page">←</button>
+              <span id="page-number">Page 1 of 1</span>
+              <button type="button" class="icon-button" id="next-page" aria-label="Next page">→</button>
+            </div>
+          </footer>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="trade-dialog" id="trade-dialog" aria-labelledby="trade-dialog-title">
+    <form method="dialog"><button class="icon-button dialog-close" aria-label="Close details">×</button></form>
+    <div class="dialog-kicker">Paper trade detail</div>
+    <h2 id="trade-dialog-title">Trade</h2>
+    <div class="trade-detail-grid" id="trade-detail-grid"></div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/dashboard/app.js" defer></script>
+</body>
+</html>
