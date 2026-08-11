@@ -4,6 +4,7 @@
 **/target/
 **/data/
 /.worktrees/
+/docs/superpowers/
 
 # Local credential sources and generated broker session token.
 /api-keys.txt
