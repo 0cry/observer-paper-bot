@@ -117,6 +117,8 @@ struct DurablePaperState {
     trading_date_ist: String,
     rolling_context: Option<gemini::RollingContext>,
     history: Vec<HistoryTrade>,
+    #[serde(default)]
+    equity_curve: Vec<EquityPoint>,
     updated_at: DateTime<Utc>,
 }
 
@@ -238,7 +240,11 @@ async fn run_internal(
     };
     let (dashboard_handle, dashboard_task) = match shared_dashboard {
         Some(handle) => {
-            handle.replace(initial_dashboard_state).await;
+            handle
+                .update("live_runtime_starting", None, |state| {
+                    apply_live_start_status(state, session_view.clone(), health.clone());
+                })
+                .await;
             (handle, None)
         }
         None => {
@@ -348,24 +354,8 @@ async fn run_internal(
         ),
     );
 
-    let broker_config = PaperBrokerConfig {
-        entry_buffer_paise: points_to_paise(config.trading.entry_buffer_points)?,
-        entry_charge_paise: points_to_paise(config.trading.charge_per_fill_rupees)?,
-        exit_charge_paise: points_to_paise(config.trading.charge_per_fill_rupees)?,
-        minimum_confidence_pct: config.trading.minimum_confidence_pct.round() as u8,
-        pending_entry_ttl_ms: paper::DEFAULT_PENDING_ENTRY_TTL_MS,
-        ..PaperBrokerConfig::default()
-    };
-    let account_specs = config
-        .accounts
-        .iter()
-        .map(|account| AccountSpec {
-            account_id: account.id.clone(),
-            display_name: format!("{} (INR {:.0})", account.id, account.initial_capital_rupees),
-            starting_capital_paise: points_to_paise(account.initial_capital_rupees)
-                .expect("validated capital"),
-        })
-        .collect::<Vec<_>>();
+    let broker_config = paper_broker_config(&config)?;
+    let account_specs = paper_account_specs(&config)?;
     let now = Utc::now();
     let trading_date_ist = now
         .with_timezone(&Kolkata)
@@ -471,6 +461,10 @@ async fn run_internal(
         .map(|state| state.history.clone())
         .or(load_json_snapshot::<Vec<HistoryTrade>>(&history_path)?)
         .unwrap_or_default();
+    let mut equity_curve = remote_state
+        .as_ref()
+        .map(|state| state.equity_curve.clone())
+        .unwrap_or_default();
     deduplicate_history(&mut historical_trades);
     if let Some(store) = neon_store.as_ref() {
         save_neon_runtime(
@@ -480,6 +474,7 @@ async fn run_internal(
             &trading_date_ist,
             rolling_context.as_ref(),
             &historical_trades,
+            &equity_curve,
         )
         .await
         .context("could not establish initial durable Neon checkpoint")?;
@@ -532,7 +527,6 @@ async fn run_internal(
     )
     .await?;
     let mut signals = Vec::<SignalView>::new();
-    let mut equity_curve = Vec::<EquityPoint>::new();
     let mut last_event_sequence = 0u64;
     let mut last_closed_count = broker.closed_trade_history().len();
     let mut capture_active = true;
@@ -581,6 +575,7 @@ async fn run_internal(
                     &active_trading_date_ist,
                     rolling_context.as_ref(),
                     &historical_trades,
+                    &equity_curve,
                 ).await;
                 if let Err(error) = durable_result {
                     health.persistence = component("DEGRADED", "Neon checkpoint failed");
@@ -972,6 +967,7 @@ async fn run_internal(
                                     &active_trading_date_ist,
                                     rolling_context.as_ref(),
                                     &historical_trades,
+                                    &equity_curve,
                                 )
                                 .await
                             {
@@ -1302,6 +1298,7 @@ async fn run_internal(
             &active_trading_date_ist,
             rolling_context.as_ref(),
             &historical_trades,
+            &equity_curve,
         )
         .await
         .context("final Neon checkpoint failed")?;
@@ -1325,6 +1322,11 @@ async fn run_internal(
     Ok(())
 }
 
+fn apply_live_start_status(state: &mut DashboardState, session: SessionView, health: HealthView) {
+    state.session = session;
+    state.health = health;
+}
+
 async fn save_neon_runtime(
     store: &NeonStore,
     broker: &PaperBroker,
@@ -1332,6 +1334,7 @@ async fn save_neon_runtime(
     trading_date_ist: &str,
     rolling_context: Option<&gemini::RollingContext>,
     history: &[HistoryTrade],
+    equity_curve: &[EquityPoint],
 ) -> Result<()> {
     let state = DurablePaperState {
         broker: broker.clone(),
@@ -1339,6 +1342,7 @@ async fn save_neon_runtime(
         trading_date_ist: trading_date_ist.to_owned(),
         rolling_context: rolling_context.cloned(),
         history: history.to_vec(),
+        equity_curve: equity_curve.to_vec(),
         updated_at: Utc::now(),
     };
     store.save_runtime_state("paper-primary", &state).await
@@ -2679,6 +2683,80 @@ fn deduplicate_history(history: &mut Vec<HistoryTrade>) {
     history.retain(|trade| seen.insert(trade.trade_id.clone()));
 }
 
+fn paper_broker_config(config: &AppConfig) -> Result<PaperBrokerConfig> {
+    Ok(PaperBrokerConfig {
+        entry_buffer_paise: points_to_paise(config.trading.entry_buffer_points)?,
+        entry_charge_paise: points_to_paise(config.trading.charge_per_fill_rupees)?,
+        exit_charge_paise: points_to_paise(config.trading.charge_per_fill_rupees)?,
+        minimum_confidence_pct: config.trading.minimum_confidence_pct.round() as u8,
+        pending_entry_ttl_ms: paper::DEFAULT_PENDING_ENTRY_TTL_MS,
+        ..PaperBrokerConfig::default()
+    })
+}
+
+fn paper_account_specs(config: &AppConfig) -> Result<Vec<AccountSpec>> {
+    config
+        .accounts
+        .iter()
+        .map(|account| {
+            Ok(AccountSpec {
+                account_id: account.id.clone(),
+                display_name: format!("{} (INR {:.0})", account.id, account.initial_capital_rupees),
+                starting_capital_paise: points_to_paise(account.initial_capital_rupees)?,
+            })
+        })
+        .collect()
+}
+
+pub(crate) async fn load_idle_dashboard_state(
+    config: &AppConfig,
+    store: Option<&NeonStore>,
+) -> Result<DashboardState> {
+    let durable = match store {
+        Some(store) => store
+            .load_runtime_state::<DurablePaperState>("paper-primary")
+            .await
+            .context("could not restore durable Neon paper state")?,
+        None => None,
+    };
+    idle_dashboard_from_parts(
+        paper_broker_config(config)?,
+        paper_account_specs(config)?,
+        durable,
+        config.trading.charge_per_fill_rupees,
+    )
+}
+
+fn idle_dashboard_from_parts(
+    broker_config: PaperBrokerConfig,
+    account_specs: Vec<AccountSpec>,
+    durable: Option<DurablePaperState>,
+    exit_charge_rupees: f64,
+) -> Result<DashboardState> {
+    let (persisted_broker, history, equity_curve) = match durable {
+        Some(state) => (Some(state.broker), state.history, state.equity_curve),
+        None => (None, Vec::new(), Vec::new()),
+    };
+    let broker = match persisted_broker {
+        Some(persisted) => PaperBroker::restore_from_persisted(
+            persisted,
+            broker_config.clone(),
+            account_specs.clone(),
+        )
+        .context("persisted paper broker state is incompatible with current configuration")?,
+        None => PaperBroker::with_accounts(broker_config, account_specs)?,
+    };
+    Ok(dashboard_state(
+        &broker.snapshot(Utc::now().timestamp_millis()),
+        SessionView::default(),
+        HealthView::default(),
+        Vec::new(),
+        equity_curve,
+        history,
+        exit_charge_rupees,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dashboard_state(
     snapshot: &PaperBrokerSnapshot,
@@ -3169,6 +3247,152 @@ mod tests {
             dashboard_account_id(ShadowMode::LlmExit, "a"),
             dashboard_account_id(ShadowMode::MovingSl, "a")
         );
+    }
+
+    #[test]
+    fn idle_dashboard_without_durable_state_has_ten_strategy_wallets() {
+        let accounts = [5_000_i64, 10_000, 2_000, 15_000, 20_000]
+            .into_iter()
+            .enumerate()
+            .map(|(index, rupees)| AccountSpec {
+                account_id: format!("account_{}", index + 1),
+                display_name: format!("Account {}", index + 1),
+                starting_capital_paise: rupees * 100,
+            })
+            .collect::<Vec<_>>();
+
+        let state =
+            idle_dashboard_from_parts(PaperBrokerConfig::default(), accounts, None, 20.0).unwrap();
+
+        assert_eq!(state.accounts.len(), 10);
+        assert_eq!(
+            state
+                .accounts
+                .iter()
+                .filter(|account| account.strategy == "LLM_EXIT")
+                .count(),
+            5
+        );
+        assert_eq!(
+            state
+                .accounts
+                .iter()
+                .filter(|account| account.strategy == "MOVING_SL")
+                .count(),
+            5
+        );
+        assert_eq!(state.metrics.starting_capital, 104_000.0);
+    }
+
+    #[test]
+    fn idle_dashboard_restores_durable_history_and_equity_curve() {
+        let broker_config = PaperBrokerConfig::default();
+        let accounts = vec![AccountSpec {
+            account_id: "account_1".to_owned(),
+            display_name: "Account 1".to_owned(),
+            starting_capital_paise: 500_000,
+        }];
+        let broker = PaperBroker::with_accounts(broker_config.clone(), accounts.clone()).unwrap();
+        let history = vec![HistoryTrade {
+            trade_id: "trade-1".to_owned(),
+            net_pnl: 125.0,
+            ..HistoryTrade::default()
+        }];
+        let equity_curve = vec![EquityPoint {
+            timestamp: "2026-08-11T10:00:00Z".to_owned(),
+            equity: 10_125.0,
+            realized_pnl: 125.0,
+            ..EquityPoint::default()
+        }];
+        let durable = DurablePaperState {
+            broker,
+            stream_url: "https://www.youtube.com/watch?v=test".to_owned(),
+            trading_date_ist: "2026-08-11".to_owned(),
+            rolling_context: None,
+            history: history.clone(),
+            equity_curve: equity_curve.clone(),
+            updated_at: Utc::now(),
+        };
+
+        let state =
+            idle_dashboard_from_parts(broker_config, accounts, Some(durable), 20.0).unwrap();
+
+        assert_eq!(state.history, history);
+        assert_eq!(state.equity_curve, equity_curve);
+    }
+
+    #[test]
+    fn legacy_durable_state_without_equity_curve_still_loads() {
+        let durable = DurablePaperState {
+            broker: PaperBroker::with_accounts(
+                PaperBrokerConfig::default(),
+                vec![AccountSpec {
+                    account_id: "account_1".to_owned(),
+                    display_name: "Account 1".to_owned(),
+                    starting_capital_paise: 500_000,
+                }],
+            )
+            .unwrap(),
+            stream_url: String::new(),
+            trading_date_ist: "2026-08-11".to_owned(),
+            rolling_context: None,
+            history: Vec::new(),
+            equity_curve: Vec::new(),
+            updated_at: Utc::now(),
+        };
+        let mut value = serde_json::to_value(durable).unwrap();
+        value.as_object_mut().unwrap().remove("equity_curve");
+
+        let restored: DurablePaperState = serde_json::from_value(value).unwrap();
+
+        assert!(restored.equity_curve.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_preload_without_neon_uses_configured_accounts() {
+        let config = AppConfig::from_values(
+            "C:/project",
+            [
+                ("GEMINI_API_KEY", "test-gemini-key"),
+                ("ELEVENLABS_API_KEY", "test-elevenlabs-key"),
+            ],
+        )
+        .unwrap();
+
+        let state = load_idle_dashboard_state(&config, None).await.unwrap();
+
+        assert_eq!(state.accounts.len(), 10);
+        assert_eq!(state.metrics.starting_capital, 104_000.0);
+    }
+
+    #[test]
+    fn live_start_status_preserves_preloaded_desk_data() {
+        let mut state = DashboardState::empty();
+        state.accounts.push(AccountView {
+            account_id: "LLM_EXIT:account_1".to_owned(),
+            ..AccountView::default()
+        });
+        state.history.push(HistoryTrade {
+            trade_id: "trade-1".to_owned(),
+            ..HistoryTrade::default()
+        });
+
+        apply_live_start_status(
+            &mut state,
+            SessionView {
+                status: "STARTING".to_owned(),
+                ..SessionView::default()
+            },
+            HealthView {
+                overall: "STARTING".to_owned(),
+                ..HealthView::default()
+            },
+        );
+
+        assert_eq!(state.session.status, "STARTING");
+        assert_eq!(state.health.overall, "STARTING");
+        assert_eq!(state.accounts.len(), 1);
+        assert_eq!(state.history.len(), 1);
     }
 
     #[test]

@@ -33,13 +33,6 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
         .youtube_channel_url
         .clone()
         .ok_or_else(|| anyhow::anyhow!("YOUTUBE_CHANNEL_URL is required for daemon mode"))?;
-    let initial = waiting_state(
-        "STARTING",
-        "IST scheduler initializing",
-        &channel_url,
-        &config,
-    );
-    let handle = DashboardHandle::new(initial);
     let mut storage_error = None;
     let log_store = match config.database.url.as_ref() {
         Some(url) => match NeonStore::connect(url.expose_secret()).await {
@@ -51,7 +44,26 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
         },
         None => None,
     };
-    let runtime_logger = RuntimeEventLogger::new(handle.clone(), log_store);
+    let mut initial =
+        match paper_runtime::load_idle_dashboard_state(&config, log_store.as_ref()).await {
+            Ok(state) => state,
+            Err(error) => {
+                storage_error = Some(error.to_string());
+                paper_runtime::load_idle_dashboard_state(&config, None)
+                    .await
+                    .context("could not initialize fallback paper wallets")?
+            }
+        };
+    apply_waiting_status(
+        &mut initial,
+        "STARTING",
+        "IST scheduler initializing",
+        &channel_url,
+        &config,
+        storage_error.is_some(),
+    );
+    let handle = DashboardHandle::new(initial);
+    let runtime_logger = RuntimeEventLogger::new(handle.clone(), log_store.clone());
     if let Err(error) = runtime_logger.load_recent(200).await {
         storage_error = Some(error.to_string());
     }
@@ -69,7 +81,7 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
             .update("persistence_degraded", None, |state| {
                 state.health.persistence = component_health(
                     "DEGRADED",
-                    "durable operational log storage is unavailable; in-memory logs remain active",
+                    "durable paper state is unavailable; configured fallback wallets are displayed",
                 );
                 state.health.overall = "DEGRADED".to_owned();
             })
@@ -110,32 +122,28 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
         let trading_day = is_trading_day(date, &config.scheduler.market_holidays_ist);
 
         if !trading_day {
-            handle
-                .replace(with_storage_health(
-                    waiting_state(
-                        "MARKET_CLOSED",
-                        "Weekend or configured NSE F&O holiday",
-                        &channel_url,
-                        &config,
-                    ),
-                    storage_degraded,
-                ))
-                .await;
+            publish_waiting_status(
+                &handle,
+                "MARKET_CLOSED",
+                "Weekend or configured NSE F&O holiday",
+                &channel_url,
+                &config,
+                storage_degraded,
+            )
+            .await;
             sleep(Duration::from_secs(60)).await;
             continue;
         }
         if time < config.scheduler.poll_start_ist {
-            handle
-                .replace(with_storage_health(
-                    waiting_state(
-                        "WAITING_FOR_09_00_IST",
-                        "Market-day supervisor is idle until 09:00 IST",
-                        &channel_url,
-                        &config,
-                    ),
-                    storage_degraded,
-                ))
-                .await;
+            publish_waiting_status(
+                &handle,
+                "WAITING_FOR_09_00_IST",
+                "Market-day supervisor is idle until 09:00 IST",
+                &channel_url,
+                &config,
+                storage_degraded,
+            )
+            .await;
             sleep(Duration::from_secs(60)).await;
             continue;
         }
@@ -145,32 +153,28 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
             } else {
                 "DISCOVERY_CLOSED"
             };
-            handle
-                .replace(with_storage_health(
-                    waiting_state(
-                        status,
-                        "No new stream discovery after 15:30 IST; workers remain stopped",
-                        &channel_url,
-                        &config,
-                    ),
-                    storage_degraded,
-                ))
-                .await;
+            publish_waiting_status(
+                &handle,
+                status,
+                "No new stream discovery after 15:30 IST; workers remain stopped",
+                &channel_url,
+                &config,
+                storage_degraded,
+            )
+            .await;
             sleep(Duration::from_secs(60)).await;
             continue;
         }
 
-        handle
-            .replace(with_storage_health(
-                waiting_state(
-                    "CHECKING_CHANNEL",
-                    "Checking Trading Cafe India for a current live stream",
-                    &channel_url,
-                    &config,
-                ),
-                storage_degraded,
-            ))
-            .await;
+        publish_waiting_status(
+            &handle,
+            "CHECKING_CHANNEL",
+            "Checking Trading Cafe India for a current live stream",
+            &channel_url,
+            &config,
+            storage_degraded,
+        )
+        .await;
         match discover_live_url(&config.paths.yt_dlp_path, &channel_url).await {
             Ok(Some(stream_url)) => {
                 runtime_logger
@@ -204,17 +208,15 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
                             &format!("paper session stopped safely: {error}"),
                         )
                         .await;
-                    handle
-                        .replace(with_storage_health(
-                            waiting_state(
-                                "SESSION_FAILED",
-                                &format!("Paper session stopped safely: {error}"),
-                                &channel_url,
-                                &config,
-                            ),
-                            storage_degraded,
-                        ))
-                        .await;
+                    publish_waiting_status(
+                        &handle,
+                        "SESSION_FAILED",
+                        &format!("Paper session stopped safely: {error}"),
+                        &channel_url,
+                        &config,
+                        storage_degraded,
+                    )
+                    .await;
                 }
                 if let Err(error) = purge_raw_session_data(
                     project_dir,
@@ -243,17 +245,15 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
                 }
             }
             Ok(None) => {
-                handle
-                    .replace(with_storage_health(
-                        waiting_state(
-                            "WAITING_FOR_LIVE",
-                            "Channel is not live; next check follows the configured interval",
-                            &channel_url,
-                            &config,
-                        ),
-                        storage_degraded,
-                    ))
-                    .await;
+                publish_waiting_status(
+                    &handle,
+                    "WAITING_FOR_LIVE",
+                    "Channel is not live; next check follows the configured interval",
+                    &channel_url,
+                    &config,
+                    storage_degraded,
+                )
+                .await;
             }
             Err(error) => {
                 runtime_logger
@@ -264,17 +264,15 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
                         &format!("YouTube discovery failed safely: {error}"),
                     )
                     .await;
-                handle
-                    .replace(with_storage_health(
-                        waiting_state(
-                            "DISCOVERY_DEGRADED",
-                            &format!("YouTube discovery failed safely: {error}"),
-                            &channel_url,
-                            &config,
-                        ),
-                        storage_degraded,
-                    ))
-                    .await;
+                publish_waiting_status(
+                    &handle,
+                    "DISCOVERY_DEGRADED",
+                    &format!("YouTube discovery failed safely: {error}"),
+                    &channel_url,
+                    &config,
+                    storage_degraded,
+                )
+                .await;
             }
         }
         sleep(Duration::from_secs(
@@ -374,6 +372,44 @@ fn waiting_state(
     }
 }
 
+fn apply_waiting_status(
+    state: &mut DashboardState,
+    status: &str,
+    message: &str,
+    channel_url: &str,
+    config: &AppConfig,
+    storage_degraded: bool,
+) {
+    let waiting = with_storage_health(
+        waiting_state(status, message, channel_url, config),
+        storage_degraded,
+    );
+    state.session = waiting.session;
+    state.health = waiting.health;
+}
+
+async fn publish_waiting_status(
+    handle: &DashboardHandle,
+    status: &str,
+    message: &str,
+    channel_url: &str,
+    config: &AppConfig,
+    storage_degraded: bool,
+) {
+    handle
+        .update("scheduler_status", None, |state| {
+            apply_waiting_status(
+                state,
+                status,
+                message,
+                channel_url,
+                config,
+                storage_degraded,
+            );
+        })
+        .await;
+}
+
 fn stopped_component(message: &str) -> ComponentHealth {
     ComponentHealth {
         status: "IDLE".to_owned(),
@@ -394,7 +430,7 @@ fn with_storage_health(mut state: DashboardState, degraded: bool) -> DashboardSt
     if degraded {
         state.health.persistence = component_health(
             "DEGRADED",
-            "durable operational log storage is unavailable; in-memory logs remain active",
+            "durable paper state is unavailable; configured fallback wallets are displayed",
         );
         state.health.overall = "DEGRADED".to_owned();
     }
@@ -452,6 +488,17 @@ fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn test_config() -> AppConfig {
+        AppConfig::from_values(
+            "C:/project",
+            [
+                ("GEMINI_API_KEY", "test-gemini-key"),
+                ("ELEVENLABS_API_KEY", "test-elevenlabs-key"),
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn weekends_and_configured_holidays_are_closed() {
         let holiday = NaiveDate::from_ymd_opt(2026, 1, 26).unwrap();
@@ -464,5 +511,72 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
             &[]
         ));
+    }
+
+    #[test]
+    fn waiting_status_preserves_durable_desk_data() {
+        let config = test_config();
+        let mut state = DashboardState::empty();
+        state.accounts.push(Default::default());
+        state.positions.push(Default::default());
+        state.pending_orders.push(Default::default());
+        state.metrics.starting_capital = 104_000.0;
+        state.signals.push(Default::default());
+        state.equity_curve.push(Default::default());
+        state.history.push(Default::default());
+        state.logs.push(Default::default());
+        let durable = (
+            state.accounts.clone(),
+            state.positions.clone(),
+            state.pending_orders.clone(),
+            state.metrics.clone(),
+            state.signals.clone(),
+            state.equity_curve.clone(),
+            state.history.clone(),
+            state.logs.clone(),
+        );
+
+        apply_waiting_status(
+            &mut state,
+            "WORKERS_STOPPED",
+            "Trading workers are offline",
+            "https://www.youtube.com/@TRADINGCAFEINDIA",
+            &config,
+            false,
+        );
+
+        assert_eq!(state.session.status, "WORKERS_STOPPED");
+        assert_eq!(state.accounts, durable.0);
+        assert_eq!(state.positions, durable.1);
+        assert_eq!(state.pending_orders, durable.2);
+        assert_eq!(state.metrics, durable.3);
+        assert_eq!(state.signals, durable.4);
+        assert_eq!(state.equity_curve, durable.5);
+        assert_eq!(state.history, durable.6);
+        assert_eq!(state.logs, durable.7);
+    }
+
+    #[test]
+    fn degraded_waiting_status_keeps_fallback_wallets_visible() {
+        let config = test_config();
+        let mut state = DashboardState::empty();
+        state.accounts.resize_with(10, Default::default);
+
+        apply_waiting_status(
+            &mut state,
+            "WORKERS_STOPPED",
+            "Trading workers are offline",
+            "https://www.youtube.com/@TRADINGCAFEINDIA",
+            &config,
+            true,
+        );
+
+        assert_eq!(state.accounts.len(), 10);
+        assert_eq!(state.health.overall, "DEGRADED");
+        assert_eq!(state.health.persistence.status, "DEGRADED");
+        assert_eq!(
+            state.health.persistence.message,
+            "durable paper state is unavailable; configured fallback wallets are displayed"
+        );
     }
 }
