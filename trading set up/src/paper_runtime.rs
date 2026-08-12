@@ -25,7 +25,10 @@ use tokio::{
 
 use crate::{
     InstrumentRow, TokenManager,
-    capture::{CaptureConfig, CaptureEvent, CaptureSession, MediaSegment, MediaWindow},
+    capture::{
+        CaptureConfig, CaptureEvent, CaptureSession, MediaSegment, MediaWindow, SEGMENT_SECONDS,
+        WINDOW_SECONDS, WINDOW_SEGMENTS,
+    },
     config::AppConfig,
     dashboard::{
         self, AccountView, ApiKeyHealthView, ComponentHealth, DashboardHandle, DashboardState,
@@ -493,7 +496,7 @@ async fn run_internal(
         .context("could not start current-live-edge capture")?;
     let capture_controller = capture.controller();
     session_view.status = "RUNNING".to_owned();
-    health.stream_capture = component("STARTING", "waiting for the first closed 5-second segment");
+    health.stream_capture = component("STARTING", "waiting for the first closed 4-second segment");
     health.persistence = component(
         "HEALTHY",
         if neon_store.is_some() {
@@ -620,7 +623,7 @@ async fn run_internal(
             capture_event = capture.next_event(), if capture_active => {
                 match capture_event {
                     Some(CaptureEvent::SegmentReady(segment)) => {
-                        health.stream_capture = component("HEALTHY", "receiving exact 5-second live-edge segments");
+                        health.stream_capture = component("HEALTHY", "receiving exact 4-second live-edge segments");
                         session_view.transcript_segments_ready = transcripts.len();
                         spawn_stt_job(stt_client.clone(), stt_sender.clone(), segment);
                     }
@@ -1391,11 +1394,11 @@ fn spawn_stt_job(
 ) {
     tokio::spawn(async move {
         let started = Instant::now();
-        let start_sec = segment.sequence as f64 * 5.0;
+        let start_sec = segment.sequence as f64 * SEGMENT_SECONDS as f64;
         let input = SegmentInput::new(
             segment.sequence,
             start_sec,
-            start_sec + 5.0,
+            start_sec + SEGMENT_SECONDS as f64,
             segment.path.clone(),
         );
         let transcript = client.transcribe_segment(input).await;
@@ -1432,7 +1435,7 @@ fn launch_next_ready_window(
     let Some((&sequence, oldest)) = pending.first_key_value() else {
         return;
     };
-    if oldest.segments.len() != 4
+    if oldest.segments.len() != WINDOW_SEGMENTS
         || !oldest
             .segments
             .iter()
@@ -1490,7 +1493,7 @@ fn launch_next_ready_window(
     health.gemini = component(
         "PROCESSING",
         format!(
-            "analyzing synchronized 20-second window {sequence} ({} queued)",
+            "analyzing synchronized 8-second window {sequence} ({} queued)",
             pending.len()
         ),
     );
@@ -1502,7 +1505,7 @@ fn launch_next_ready_window(
                 .await
                 .map_err(|error| format!("{error:#}"))
         } else {
-            Err("20-second clip exceeds the safe inline upload limit".to_owned())
+            Err("8-second clip exceeds the safe inline upload limit".to_owned())
         };
         let completed = GeminiCompleted {
             window,
@@ -1673,7 +1676,8 @@ fn build_analysis_input(
             ended_at: window.ended_at_utc,
             sent_at,
             data_age_ms: age_ms(window.ended_at_utc, sent_at),
-            complete: window.segments.len() == 4 && (19_000..=21_000).contains(&window.duration_ms),
+            complete: window.segments.len() == WINDOW_SEGMENTS
+                && window.duration_ms == WINDOW_SECONDS * 1_000,
         },
         transcripts,
         watched_options,
@@ -3525,8 +3529,8 @@ mod tests {
             .with_ymd_and_hms(2026, 8, 11, 5, 0, 30)
             .single()
             .unwrap();
-        let started_at = received_at - chrono::Duration::seconds(25);
         let ended_at = received_at - chrono::Duration::seconds(5);
+        let started_at = ended_at - chrono::Duration::seconds(WINDOW_SECONDS as i64);
         let window = MediaWindow {
             id: "test-window".to_owned(),
             sequence: 1,
@@ -3535,7 +3539,7 @@ mod tests {
             started_at_utc: started_at,
             ended_at_utc: ended_at,
             created_at_utc: ended_at,
-            duration_ms: 20_000,
+            duration_ms: WINDOW_SECONDS * 1_000,
             size_bytes: 1,
             inline_upload_safe: true,
         };
@@ -3569,9 +3573,9 @@ mod tests {
             levels: None,
             confidence_pct: 80,
             evidence_timestamps: vec![gemini::EvidenceTimestamp {
-                seconds_from_clip_start: 18.0,
+                seconds_from_clip_start: 7.0,
                 source: gemini::EvidenceSource::Both,
-                transcript_chunk: Some(3),
+                transcript_chunk: Some(1),
                 detail: None,
             }],
             rationale: "current entry call".to_owned(),
@@ -3585,9 +3589,9 @@ mod tests {
                 .contains("no evidence")
         );
         action.evidence_timestamps.push(gemini::EvidenceTimestamp {
-            seconds_from_clip_start: 18.0,
+            seconds_from_clip_start: 7.0,
             source: gemini::EvidenceSource::Both,
-            transcript_chunk: Some(3),
+            transcript_chunk: Some(1),
             detail: None,
         });
         let stale_now = ended_at + chrono::Duration::milliseconds(MAX_EXECUTABLE_SIGNAL_AGE_MS + 1);

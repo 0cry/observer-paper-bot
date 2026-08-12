@@ -1,8 +1,8 @@
 //! Bounded, timestamped media capture for a live YouTube stream.
 //!
 //! The module owns one long-running FFmpeg ingest process. FFmpeg writes closed
-//! five-second MPEG-TS segments; every four consecutive segments are remuxed
-//! into one 20-second MP4. Callers must acknowledge segment and window events.
+//! four-second MPEG-TS segments; every two consecutive segments are remuxed
+//! into one 8-second MP4. Callers must acknowledge segment and window events.
 //! A segment is only removed after it has been acknowledged by the caller and
 //! has also been consumed by the internal window assembler.
 
@@ -27,9 +27,11 @@ use tokio::{
     time::{MissedTickBehavior, interval, timeout},
 };
 
-pub const SEGMENT_SECONDS: u64 = 5;
-pub const WINDOW_SEGMENTS: usize = 4;
+pub const SEGMENT_SECONDS: u64 = 4;
+pub const WINDOW_SEGMENTS: usize = 2;
 pub const WINDOW_SECONDS: u64 = SEGMENT_SECONDS * WINDOW_SEGMENTS as u64;
+const CAPTURE_VIDEO_FPS: u64 = 5;
+const KEYFRAME_INTERVAL_FRAMES: u64 = SEGMENT_SECONDS * CAPTURE_VIDEO_FPS;
 pub const DEFAULT_CLIP_RETENTION: usize = 3;
 pub const GEMINI_INLINE_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 const STALE_CAPTURE_GRACE: Duration = Duration::from_secs(WINDOW_SECONDS * 2);
@@ -108,7 +110,7 @@ impl CaptureConfig {
     }
 }
 
-/// A closed, immutable five-second audio/video segment.
+/// A closed, immutable four-second audio/video segment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaSegment {
     pub id: String,
@@ -120,7 +122,7 @@ pub struct MediaSegment {
     pub size_bytes: u64,
 }
 
-/// Four consecutive segments published as an optimized 20-second MP4.
+/// Two consecutive segments published as an optimized 8-second MP4.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaWindow {
     pub id: String,
@@ -173,7 +175,7 @@ impl fmt::Debug for CaptureController {
 }
 
 impl CaptureController {
-    /// Acknowledge that all external users of this five-second segment (for
+    /// Acknowledge that all external users of this four-second segment (for
     /// example STT) have finished reading it.
     pub async fn acknowledge_segment(&self, segment_id: impl Into<String>) -> Result<()> {
         self.commands
@@ -182,7 +184,7 @@ impl CaptureController {
             .map_err(|_| anyhow!("capture worker is no longer running"))
     }
 
-    /// Acknowledge that downstream analysis has finished reading a 20-second
+    /// Acknowledge that downstream analysis has finished reading an 8-second
     /// MP4. Old acknowledged windows are eligible for latest-N rotation.
     pub async fn acknowledge_window(&self, window_id: impl Into<String>) -> Result<()> {
         self.commands
@@ -561,7 +563,9 @@ fn spawn_capture_process(
         .arg("-map")
         .arg("0:a:0")
         .arg("-vf")
-        .arg("fps=5,scale=-2:720:force_original_aspect_ratio=decrease:flags=fast_bilinear,format=yuv420p")
+        .arg(format!(
+            "fps={CAPTURE_VIDEO_FPS},scale=-2:720:force_original_aspect_ratio=decrease:flags=fast_bilinear,format=yuv420p"
+        ))
         .arg("-vsync")
         .arg("cfr")
         .arg("-c:v")
@@ -577,13 +581,13 @@ fn spawn_capture_process(
         .arg("-bufsize")
         .arg("1400k")
         .arg("-g")
-        .arg("25")
+        .arg(KEYFRAME_INTERVAL_FRAMES.to_string())
         .arg("-keyint_min")
-        .arg("25")
+        .arg(KEYFRAME_INTERVAL_FRAMES.to_string())
         .arg("-sc_threshold")
         .arg("0")
         .arg("-force_key_frames")
-        .arg("expr:gte(t,n_forced*5)")
+        .arg(forced_keyframe_expression())
         .arg("-c:a")
         .arg("aac")
         // Supports the older FFmpeg build already present on this machine.
@@ -619,6 +623,10 @@ fn spawn_capture_process(
             config.ffmpeg_path.display()
         )
     })
+}
+
+fn forced_keyframe_expression() -> String {
+    format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})")
 }
 
 struct SegmentLifecycle {
@@ -1299,7 +1307,7 @@ async fn build_window(
     segments: &[MediaSegment],
 ) -> Result<MediaWindow> {
     if segments.len() != WINDOW_SEGMENTS {
-        bail!("a media window requires exactly four segments");
+        bail!("a media window requires exactly two segments");
     }
     for pair in segments.windows(2) {
         if pair[0].sequence.checked_add(1) != Some(pair[1].sequence)
@@ -1417,7 +1425,7 @@ async fn package_with_ffmpeg(
         .arg("-movflags")
         .arg("+faststart")
         .arg(output_path);
-    run_bounded_ffmpeg(config, command, "20-second clip packaging").await
+    run_bounded_ffmpeg(config, command, "8-second clip packaging").await
 }
 
 async fn compact_with_ffmpeg(
@@ -1625,30 +1633,37 @@ mod tests {
     }
 
     #[test]
-    fn groups_exactly_four_consecutive_non_overlapping_segments() {
+    fn capture_contract_is_two_four_second_segments_per_window() {
+        assert_eq!(SEGMENT_SECONDS, 4);
+        assert_eq!(WINDOW_SEGMENTS, 2);
+        assert_eq!(WINDOW_SECONDS, 8);
+        assert_eq!(KEYFRAME_INTERVAL_FRAMES, 20);
+        assert_eq!(forced_keyframe_expression(), "expr:gte(t,n_forced*4)");
+    }
+
+    #[test]
+    fn groups_exactly_two_consecutive_non_overlapping_segments() {
         let base = DateTime::parse_from_rfc3339("2026-08-11T03:16:40Z")
             .unwrap()
             .with_timezone(&Utc);
         let mut grouper = SegmentGrouper::default();
-        for sequence in 0..3 {
-            let result = grouper.push(segment(sequence, base));
-            assert!(result.complete.is_none());
-            assert!(result.abandoned.is_empty());
-        }
-        let first = grouper.push(segment(3, base)).complete.unwrap();
+        let pending = grouper.push(segment(0, base));
+        assert!(pending.complete.is_none());
+        assert!(pending.abandoned.is_empty());
+        let first = grouper.push(segment(1, base)).complete.unwrap();
         assert_eq!(
             first.iter().map(|item| item.sequence).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3]
+            vec![0, 1]
         );
         assert_eq!(first[0].started_at_utc, base);
         assert_eq!(
-            first[3].ended_at_utc,
+            first[1].ended_at_utc,
             base + ChronoDuration::seconds(WINDOW_SECONDS as i64)
         );
 
-        for sequence in 4..8 {
+        for sequence in 2..4 {
             let result = grouper.push(segment(sequence, base));
-            if sequence == 7 {
+            if sequence == 3 {
                 assert_eq!(
                     result
                         .complete
@@ -1656,7 +1671,7 @@ mod tests {
                         .iter()
                         .map(|item| item.sequence)
                         .collect::<Vec<_>>(),
-                    vec![4, 5, 6, 7]
+                    vec![2, 3]
                 );
             } else {
                 assert!(result.complete.is_none());
@@ -1671,31 +1686,24 @@ mod tests {
             .with_timezone(&Utc);
         let mut grouper = SegmentGrouper::default();
         assert!(grouper.push(segment(0, base)).complete.is_none());
-        assert!(grouper.push(segment(1, base)).complete.is_none());
 
-        let gap = grouper.push(segment(3, base));
+        let gap = grouper.push(segment(2, base));
         assert_eq!(
             gap.abandoned
                 .iter()
                 .map(|item| item.sequence)
                 .collect::<Vec<_>>(),
-            vec![0, 1]
+            vec![0]
         );
         assert!(gap.complete.is_none());
-        for sequence in 4..7 {
-            let result = grouper.push(segment(sequence, base));
-            if sequence == 6 {
-                assert_eq!(
-                    result
-                        .complete
-                        .unwrap()
-                        .iter()
-                        .map(|item| item.sequence)
-                        .collect::<Vec<_>>(),
-                    vec![3, 4, 5, 6]
-                );
-            }
-        }
+        let complete = grouper.push(segment(3, base)).complete.unwrap();
+        assert_eq!(
+            complete
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[test]

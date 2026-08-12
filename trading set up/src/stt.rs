@@ -26,8 +26,8 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-pub const SEGMENT_SECONDS: f64 = 5.0;
-pub const WINDOW_CHUNKS: usize = 4;
+pub const SEGMENT_SECONDS: f64 = 4.0;
+pub const WINDOW_CHUNKS: usize = 2;
 pub const DEFAULT_STT_CONCURRENCY: usize = 4;
 
 const ELEVENLABS_STT_ENDPOINT: &str = "https://api.elevenlabs.io/v1/speech-to-text";
@@ -37,7 +37,7 @@ const TIMELINE_EPSILON_SECONDS: f64 = 0.001;
 
 static MULTIPART_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// One exact five-second input cut from the shared stream clock.
+/// One exact four-second input cut from the shared stream clock.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SegmentInput {
     pub index: u64,
@@ -56,7 +56,7 @@ impl SegmentInput {
         }
     }
 
-    fn is_exact_five_second_segment(&self) -> bool {
+    fn is_exact_segment(&self) -> bool {
         self.start_sec.is_finite()
             && self.end_sec.is_finite()
             && self.start_sec >= 0.0
@@ -91,7 +91,7 @@ pub enum TranscriptFailure {
 }
 
 /// A timestamped provider token. Times are absolute on the stream timeline,
-/// not relative to the five-second file.
+/// not relative to the four-second file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WordTimestamp {
     pub text: String,
@@ -460,11 +460,11 @@ impl ElevenLabsSttClient {
             .collect()
     }
 
-    /// Transcribe one declared five-second segment. Operational failures are
+    /// Transcribe one declared four-second segment. Operational failures are
     /// returned as an incomplete chunk so downstream window construction never
     /// waits indefinitely or loses the segment's timeline position.
     pub async fn transcribe_segment(&self, segment: SegmentInput) -> TranscriptChunk {
-        if !segment.is_exact_five_second_segment() {
+        if !segment.is_exact_segment() {
             return TranscriptChunk::incomplete(&segment, TranscriptFailure::InvalidSegment);
         }
 
@@ -479,8 +479,8 @@ impl ElevenLabsSttClient {
         }
     }
 
-    /// Transcribe a 20-second window as four exact, consecutive five-second
-    /// chunks. All four requests run concurrently (subject to the global
+    /// Transcribe an 8-second window as two exact, consecutive four-second
+    /// chunks. Both requests run concurrently (subject to the global
     /// semaphore), and the returned chunks are always in chronological order.
     pub async fn transcribe_window(
         &self,
@@ -774,10 +774,7 @@ fn absolute_provider_time(segment: &SegmentInput, value: Option<f64>) -> Option<
 }
 
 fn valid_window_layout(segments: &[SegmentInput; WINDOW_CHUNKS]) -> bool {
-    if !segments
-        .iter()
-        .all(SegmentInput::is_exact_five_second_segment)
-    {
+    if !segments.iter().all(SegmentInput::is_exact_segment) {
         return false;
     }
 
@@ -935,7 +932,7 @@ fn media_type_for_extension(extension: &str) -> &'static str {
         "webm" => "audio/webm",
         "mp4" => "video/mp4",
         // FFmpeg's segment muxer writes MPEG-2 transport stream chunks.  Use
-        // the registered media type so Scribe receives the five-second `.ts`
+        // the registered media type so Scribe receives the four-second `.ts`
         // segment as media instead of an opaque binary upload.
         "ts" => "video/mp2t",
         "mov" => "video/quicktime",
@@ -959,6 +956,12 @@ mod tests {
     }
 
     #[test]
+    fn transcription_contract_is_two_four_second_chunks() {
+        assert_eq!(SEGMENT_SECONDS, 4.0);
+        assert_eq!(WINDOW_CHUNKS, 2);
+    }
+
+    #[test]
     fn parses_and_deduplicates_supported_key_shapes_without_exposable_debug() {
         let first = "sk_0123456789abcdefghijklmnop";
         let second = "0123456789ABCDEF0123456789ABCDEF";
@@ -976,12 +979,8 @@ mod tests {
 
     #[test]
     fn assembles_window_in_order_and_marks_a_missing_chunk_incomplete() {
-        let expected = [segment(40), segment(41), segment(42), segment(43)];
-        let completed = vec![
-            TranscriptChunk::test_complete(&expected[3], "four"),
-            TranscriptChunk::test_complete(&expected[0], "one"),
-            TranscriptChunk::test_complete(&expected[2], "three"),
-        ];
+        let expected = [segment(40), segment(41)];
+        let completed = vec![TranscriptChunk::test_complete(&expected[0], "one")];
 
         let window = assemble_window(&expected, completed);
 
@@ -991,7 +990,7 @@ mod tests {
                 .iter()
                 .map(|chunk| chunk.index)
                 .collect::<Vec<_>>(),
-            vec![40, 41, 42, 43]
+            vec![40, 41]
         );
         assert_eq!(window.chunks[1].status, TranscriptStatus::Incomplete);
         assert_eq!(
@@ -1000,7 +999,7 @@ mod tests {
         );
         assert_eq!(window.incomplete_count, 1);
         assert!(!window.complete);
-        assert_eq!(window.text, "one three four");
+        assert_eq!(window.text, "one");
     }
 
     #[test]
@@ -1035,12 +1034,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_window_requires_four_contiguous_five_second_chunks() {
-        let mut segments = [segment(0), segment(1), segment(2), segment(3)];
+    fn exact_window_requires_two_contiguous_four_second_chunks() {
+        let mut segments = [segment(0), segment(1)];
         assert!(valid_window_layout(&segments));
 
-        segments[2].start_sec += 0.01;
-        segments[2].end_sec += 0.01;
+        segments[1].start_sec += 0.01;
+        segments[1].end_sec += 0.01;
         assert!(!valid_window_layout(&segments));
     }
 }

@@ -9,19 +9,21 @@ This project is **paper-only**. It reads market data but contains no broker orde
 The `paper` command runs the complete pipeline:
 
 1. `yt-dlp` resolves the stream's current playback URL. A long-running FFmpeg process begins at the current live edge; it does not replay the stream from the beginning.
-2. FFmpeg closes an exact 5-second MPEG-TS segment at a time. ElevenLabs Scribe v2 transcribes each segment, with bounded concurrency.
-3. Every four consecutive segments are remuxed into one 20-second MP4. Gemini receives that clip, the four timestamped transcript chunks, prompt-send time/data age, watched option LTPs, and any open LLM-managed trades.
+2. FFmpeg closes an exact 4-second MPEG-TS segment at a time. ElevenLabs Scribe v2 transcribes each segment, with bounded concurrency.
+3. Every two consecutive segments are remuxed into one 8-second MP4. Gemini receives that clip, the two timestamped transcript chunks, prompt-send time/data age, watched option LTPs, and any open LLM-managed trades.
 4. Gemini returns strict structured actions such as watch, place entry, update levels, cancel, hold, or exit. The paper broker rejects trade and exit instructions below the configured confidence threshold.
 5. Candidate, pending, and open contracts drive dynamic INDstocks subscriptions. Fresh ticks fill paper orders, update P/L, advance mechanical stops, and close positions.
 6. State, audit events, trade history, and dashboard views are updated continuously. At the configured IST end-of-day time, pending entries are cancelled and open positions close on their first fresh tick at or after the cutoff.
 
-Completed clips are retained under `data/media/clips/`; with the default `CLIPS_TO_KEEP=3`, acknowledged older clips are deleted. Temporary 5-second segments are removed after transcription and window assembly acknowledge them.
+Completed clips are retained under `data/media/clips/`; with the default `CLIPS_TO_KEEP=3`, acknowledged older clips are deleted. Temporary 4-second segments are removed after transcription and window assembly acknowledge them.
 
 ## Rolling multimodal context
 
-Every 20-second Gemini response includes a complete, bounded context snapshot: a detailed spoken summary, detailed visual summary, combined summary, structured key visual points, and active trade episodes. The runtime feeds that snapshot into the next Gemini call in FIFO order, so contracts, stated levels, and episode state can carry across a long stream without an ever-growing transcript.
+Every 8-second Gemini response includes a complete, bounded context snapshot: a detailed spoken summary, detailed visual summary, combined summary, structured key visual points, and active trade episodes. The runtime feeds that snapshot into the next Gemini call in FIFO order, so contracts, stated levels, and episode state can carry across a long stream without an ever-growing transcript.
 
-The latest snapshot is stored in `data/paper/stream_context.json` and is restored only when its stream URL and IST trading date match the current run. Earlier context may preserve contract identity and explicitly stated levels, but it is not fresh evidence and cannot trigger an order by itself; actionable commands still require evidence from the current 20-second window. All resulting execution remains paper-only.
+The latest snapshot is stored in `data/paper/stream_context.json` and is restored only when its stream URL and IST trading date match the current run. Earlier context may preserve contract identity and explicitly stated levels, but it is not fresh evidence and cannot trigger an order by itself; actionable commands still require evidence from the current 8-second window. All resulting execution remains paper-only.
+
+Gemini credentials form one unnamed shared round-robin pool (`GEMINI_API_KEY_1` through `GEMINI_API_KEY_16`). Quota, authentication, transport, timeout, and server failures cool down the affected slot and retry the same window with another healthy key. Per-slot health is exposed without revealing credential values.
 
 ## Requirements
 
@@ -195,8 +197,8 @@ The dashboard binds only to localhost by default. Change `DASHBOARD_BIND` delibe
 - `data/paper/trade_history.json` — cumulative, deduplicated closed-trade history
 - `data/paper/stream_context.json` — bounded rolling multimodal context, scoped to the exact stream URL and IST trading date
 - `data/paper/sessions/paper_<UTC timestamp>/events.jsonl` — per-run pipeline audit and broker events
-- `data/media/clips/` — retained 20-second MP4 windows
-- `data/media/segments/<session>/` — temporary exact 5-second capture segments
+- `data/media/clips/` — retained 8-second MP4 windows
+- `data/media/segments/<session>/` — temporary exact 4-second capture segments
 - `data/logs/paper_<timestamp>.stdout.log` and `.stderr.log` — background-launch logs
 - `data/runtime/paper_process.json` — background PID, start time, stream URL, and log paths
 
