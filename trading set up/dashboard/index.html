@@ -48,10 +48,6 @@
         </div>
       </section>
 
-      <div class="sidebar-foot">
-        <span class="shield" aria-hidden="true">✓</span>
-        <span><strong>Paper trading only</strong><small>No broker order routing</small></span>
-      </div>
     </aside>
 
     <main class="main" id="main-content">
@@ -84,18 +80,12 @@
             </div>
             <p>Tick-level paper positions across both exit strategies.</p>
           </div>
-          <div class="session-meta" aria-label="Session timestamps">
-            <span>Started <strong id="session-started">—</strong></span>
-            <span>Last update <strong id="last-updated">Waiting for data</strong></span>
-            <span>Tick age <strong id="tick-age">—</strong></span>
-          </div>
         </div>
 
         <fieldset class="mode-filter" aria-label="Portfolio mode">
           <legend>Portfolio mode</legend>
-          <label><input type="radio" name="mode" value="all" checked><span>All</span></label>
-          <label><input type="radio" name="mode" value="llm_exit"><span>LLM exit</span></label>
-          <label><input type="radio" name="mode" value="moving_sl"><span>Moving SL</span></label>
+          <label><input type="radio" name="mode" value="llm_exit" checked><span>Approach 1</span></label>
+          <label><input type="radio" name="mode" value="moving_sl"><span>Approach 2</span></label>
         </fieldset>
 
         <div class="kpi-grid" aria-live="polite">
@@ -206,7 +196,7 @@
         <form class="history-filters panel" id="history-filters" role="search">
           <label class="search-field"><span>Search</span><input type="search" name="q" id="history-search" placeholder="Contract, account or setup ID" autocomplete="off"></label>
           <label><span>Status</span><select name="status" id="history-status"><option value="">All statuses</option><option value="won">Won</option><option value="lost">Lost</option><option value="breakeven">Breakeven</option><option value="open">Open</option><option value="cancelled">Cancelled</option></select></label>
-          <label><span>Mode</span><select name="mode" id="history-mode"><option value="">All modes</option><option value="llm_exit">LLM exit</option><option value="moving_sl">Moving SL</option></select></label>
+          <label><span>Mode</span><select name="mode" id="history-mode"><option value="">All modes</option><option value="llm_exit">Approach 1</option><option value="moving_sl">Approach 2</option></select></label>
           <label><span>Account</span><select name="account" id="history-account"><option value="">All accounts</option></select></label>
           <label><span>Underlying</span><select name="underlying" id="history-underlying"><option value="">All underlyings</option><option value="NIFTY">NIFTY</option><option value="SENSEX">SENSEX</option></select></label>
           <label><span>From</span><input type="date" name="from" id="history-from"></label>

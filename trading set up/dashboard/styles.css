@@ -149,7 +149,7 @@ a:focus-visible {
 .source-status ul { display: grid; gap: 13px; margin: 0; padding: 0; list-style: none; }
 .source-status li { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-soft); font-size: 12px; }
 .source-status li span { display: flex; align-items: center; min-width: 0; gap: 8px; }
-.source-status li b { overflow: hidden; color: var(--text-muted); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.source-status li b { display: none; }
 .api-key-health { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
 .api-key-health .sidebar-section-title { margin-bottom: 12px; }
 .source-status li.key-health-empty { color: var(--text-muted); font-size: 10px; }

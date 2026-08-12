@@ -12,7 +12,7 @@
   const els = {};
   const app = {
     view: "live",
-    mode: "all",
+    mode: "llm_exit",
     state: null,
     health: null,
     apiOnline: false,
@@ -57,12 +57,12 @@
     second: "2-digit",
     hour12: false,
   });
-  const TIME = new Intl.DateTimeFormat("en-IN", {
+  const TIME = new Intl.DateTimeFormat("en-US", {
     timeZone: IST,
-    hour: "2-digit",
+    hour: "numeric",
     minute: "2-digit",
     second: "2-digit",
-    hour12: false,
+    hour12: true,
   });
   const DAY = new Intl.DateTimeFormat("en-IN", {
     timeZone: IST,
@@ -216,8 +216,8 @@
 
   function modeLabel(value) {
     const mode = canonicalMode(value);
-    if (mode === "llm_exit") return "LLM exit";
-    if (mode === "moving_sl") return "Moving SL";
+    if (mode === "llm_exit") return "Approach 1";
+    if (mode === "moving_sl") return "Approach 2";
     return cleanText(value, "Shared");
   }
 
@@ -559,14 +559,12 @@
   }
 
   function renderSession(data) {
-    els["last-updated"].textContent = formatDateTime(data.generatedAt, "Waiting for data");
-    els["session-started"].textContent = formatDateTime(data.session.startedAt);
-    els["tick-age"].textContent = relativeAge(data.session.tickAt);
     const market = cleanText(data.session.marketStatus, marketStatusByClock());
-    const open = String(market).toLowerCase().includes("open");
-    els["market-pill"].textContent = `Market ${market}`;
-    els["market-pill"].classList.toggle("is-open", open);
-    els["market-pill"].classList.toggle("is-closed", !open && market !== "—");
+    const status = `${data.session.status || ""} ${market}`.toLowerCase();
+    const online = !/(stopped|offline|failed|closed|market_closed)/.test(status);
+    els["market-pill"].textContent = online ? "Online" : "Offline";
+    els["market-pill"].classList.toggle("is-open", online);
+    els["market-pill"].classList.toggle("is-closed", !online);
   }
 
   function renderLive() {
@@ -880,25 +878,31 @@
     if (!host) return;
     const slots = list(pick(app.health || {}, ["components.api_keys", "api_keys"], []));
     host.replaceChildren();
-    if (!slots.length) {
-      const empty = document.createElement("li");
-      empty.className = "key-health-empty";
-      empty.textContent = "Waiting for runtime";
-      host.append(empty);
-      return;
-    }
-    slots.forEach((slot) => {
-      const status = String(firstDefined(slot.status, slot.state, "UNKNOWN")).toUpperCase();
+    const providers = [
+      { name: "Gemini", expected: 6 },
+      { name: "ElevenLabs", expected: 3 },
+    ];
+    providers.forEach((provider) => {
+      const providerSlots = slots.filter((slot) =>
+        String(slot.provider || "").toLowerCase() === provider.name.toLowerCase(),
+      );
+      const statuses = providerSlots.map((slot) =>
+        String(firstDefined(slot.status, slot.state, "UNKNOWN")).toUpperCase(),
+      );
+      const status = statuses.includes("COOLDOWN")
+        ? "COOLDOWN"
+        : statuses.length && statuses.every((value) => value === "READY")
+          ? "READY"
+          : slots.length
+            ? "DEGRADED"
+            : "UNKNOWN";
       const row = document.createElement("li");
       const label = document.createElement("span");
       const dot = document.createElement("i");
       dot.className = `status-dot ${status === "READY" ? "is-good" : status === "COOLDOWN" ? "is-warn" : "is-bad"}`;
-      label.append(dot, `${cleanText(slot.provider, "API")} Key ${number(slot.slot, 0)}`);
+      label.append(dot, provider.name);
       const value = document.createElement("b");
-      value.textContent = status === "COOLDOWN"
-        ? `Retry ${Math.ceil(number(slot.cooldown_remaining_ms, 0) / 1000)}s`
-        : status;
-      value.title = slot.last_failure ? `Last failure: ${cleanText(slot.last_failure)}` : status;
+      value.textContent = String(providerSlots.length || provider.expected);
       row.append(label, value);
       host.append(row);
     });
@@ -1255,7 +1259,6 @@
     els["live-clock"].innerHTML = `${TIME.format(now)} <small>IST</small>`;
     els["session-date"].textContent = DAY.format(now);
     if (app.state) {
-      els["tick-age"].textContent = relativeAge(app.state.session.tickAt);
       if (!pick(app.state.session, ["marketStatus"])) renderSession(modeData());
     }
   }
