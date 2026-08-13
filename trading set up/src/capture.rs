@@ -1,8 +1,8 @@
 //! Bounded, timestamped media capture for a live YouTube stream.
 //!
 //! The module owns one long-running FFmpeg ingest process. FFmpeg writes closed
-//! four-second MPEG-TS segments; every two consecutive segments are remuxed
-//! into one 8-second MP4. Callers must acknowledge segment and window events.
+//! five-second MPEG-TS segments; every four consecutive segments are remuxed
+//! into one 20-second MP4. Callers must acknowledge segment and window events.
 //! A segment is only removed after it has been acknowledged by the caller and
 //! has also been consumed by the internal window assembler.
 
@@ -27,8 +27,8 @@ use tokio::{
     time::{MissedTickBehavior, interval, timeout},
 };
 
-pub const SEGMENT_SECONDS: u64 = 4;
-pub const WINDOW_SEGMENTS: usize = 2;
+pub const SEGMENT_SECONDS: u64 = 5;
+pub const WINDOW_SEGMENTS: usize = 4;
 pub const WINDOW_SECONDS: u64 = SEGMENT_SECONDS * WINDOW_SEGMENTS as u64;
 const CAPTURE_VIDEO_FPS: u64 = 5;
 const KEYFRAME_INTERVAL_FRAMES: u64 = SEGMENT_SECONDS * CAPTURE_VIDEO_FPS;
@@ -110,7 +110,7 @@ impl CaptureConfig {
     }
 }
 
-/// A closed, immutable four-second audio/video segment.
+/// A closed, immutable five-second audio/video segment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaSegment {
     pub id: String,
@@ -122,7 +122,7 @@ pub struct MediaSegment {
     pub size_bytes: u64,
 }
 
-/// Two consecutive segments published as an optimized 8-second MP4.
+/// Four consecutive segments published as an optimized 20-second MP4.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaWindow {
     pub id: String,
@@ -155,6 +155,10 @@ pub enum CaptureEvent {
     WindowReady(MediaWindow),
     Fault {
         at_utc: DateTime<Utc>,
+        /// Fatal faults terminate the worker and require a fresh live-edge
+        /// session. Non-fatal faults describe skipped derived work while the
+        /// same FFmpeg process continues.
+        fatal: bool,
         message: String,
     },
     Stopped {
@@ -175,7 +179,7 @@ impl fmt::Debug for CaptureController {
 }
 
 impl CaptureController {
-    /// Acknowledge that all external users of this four-second segment (for
+    /// Acknowledge that all external users of this five-second segment (for
     /// example STT) have finished reading it.
     pub async fn acknowledge_segment(&self, segment_id: impl Into<String>) -> Result<()> {
         self.commands
@@ -184,7 +188,7 @@ impl CaptureController {
             .map_err(|_| anyhow!("capture worker is no longer running"))
     }
 
-    /// Acknowledge that downstream analysis has finished reading an 8-second
+    /// Acknowledge that downstream analysis has finished reading a 20-second
     /// MP4. Old acknowledged windows are eligible for latest-N rotation.
     pub async fn acknowledge_window(&self, window_id: impl Into<String>) -> Result<()> {
         self.commands
@@ -715,6 +719,7 @@ async fn run_capture_worker(
                 &events,
                 CaptureEvent::Fault {
                     at_utc: Utc::now(),
+                    fatal: true,
                     message: format!("capture pipeline stopped: {error:#}"),
                 },
                 state.config.event_send_timeout,
@@ -865,9 +870,19 @@ impl WorkerState {
             .filter(|lifecycle| !lifecycle.acknowledged)
             .count();
         if inflight_windows >= self.config.max_inflight_windows {
-            bail!(
-                "capture reached the in-flight window limit; downstream acknowledgements are too slow"
-            );
+            let skipped_sequence = self.next_window;
+            self.next_window = self.next_window.saturating_add(1);
+            for segment in &segments {
+                self.mark_assembled_and_maybe_delete(&segment.id).await?;
+            }
+            let _ = events.try_send(CaptureEvent::Fault {
+                at_utc: Utc::now(),
+                fatal: false,
+                message: format!(
+                    "skipped analysis window {skipped_sequence} at the live edge because {inflight_windows} older windows are still in use"
+                ),
+            });
+            return Ok(());
         }
         let window = build_window(
             &self.config,
@@ -1307,7 +1322,7 @@ async fn build_window(
     segments: &[MediaSegment],
 ) -> Result<MediaWindow> {
     if segments.len() != WINDOW_SEGMENTS {
-        bail!("a media window requires exactly two segments");
+        bail!("a media window requires exactly four segments");
     }
     for pair in segments.windows(2) {
         if pair[0].sequence.checked_add(1) != Some(pair[1].sequence)
@@ -1425,7 +1440,7 @@ async fn package_with_ffmpeg(
         .arg("-movflags")
         .arg("+faststart")
         .arg(output_path);
-    run_bounded_ffmpeg(config, command, "8-second clip packaging").await
+    run_bounded_ffmpeg(config, command, "20-second clip packaging").await
 }
 
 async fn compact_with_ffmpeg(
@@ -1633,16 +1648,16 @@ mod tests {
     }
 
     #[test]
-    fn capture_contract_is_two_four_second_segments_per_window() {
-        assert_eq!(SEGMENT_SECONDS, 4);
-        assert_eq!(WINDOW_SEGMENTS, 2);
-        assert_eq!(WINDOW_SECONDS, 8);
-        assert_eq!(KEYFRAME_INTERVAL_FRAMES, 20);
-        assert_eq!(forced_keyframe_expression(), "expr:gte(t,n_forced*4)");
+    fn capture_contract_is_four_five_second_segments_per_window() {
+        assert_eq!(SEGMENT_SECONDS, 5);
+        assert_eq!(WINDOW_SEGMENTS, 4);
+        assert_eq!(WINDOW_SECONDS, 20);
+        assert_eq!(KEYFRAME_INTERVAL_FRAMES, 25);
+        assert_eq!(forced_keyframe_expression(), "expr:gte(t,n_forced*5)");
     }
 
     #[test]
-    fn groups_exactly_two_consecutive_non_overlapping_segments() {
+    fn groups_exactly_four_consecutive_non_overlapping_segments() {
         let base = DateTime::parse_from_rfc3339("2026-08-11T03:16:40Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -1650,20 +1665,22 @@ mod tests {
         let pending = grouper.push(segment(0, base));
         assert!(pending.complete.is_none());
         assert!(pending.abandoned.is_empty());
-        let first = grouper.push(segment(1, base)).complete.unwrap();
+        assert!(grouper.push(segment(1, base)).complete.is_none());
+        assert!(grouper.push(segment(2, base)).complete.is_none());
+        let first = grouper.push(segment(3, base)).complete.unwrap();
         assert_eq!(
             first.iter().map(|item| item.sequence).collect::<Vec<_>>(),
-            vec![0, 1]
+            vec![0, 1, 2, 3]
         );
         assert_eq!(first[0].started_at_utc, base);
         assert_eq!(
-            first[1].ended_at_utc,
+            first[3].ended_at_utc,
             base + ChronoDuration::seconds(WINDOW_SECONDS as i64)
         );
 
-        for sequence in 2..4 {
+        for sequence in 4..8 {
             let result = grouper.push(segment(sequence, base));
-            if sequence == 3 {
+            if sequence == 7 {
                 assert_eq!(
                     result
                         .complete
@@ -1671,7 +1688,7 @@ mod tests {
                         .iter()
                         .map(|item| item.sequence)
                         .collect::<Vec<_>>(),
-                    vec![2, 3]
+                    vec![4, 5, 6, 7]
                 );
             } else {
                 assert!(result.complete.is_none());
@@ -1696,13 +1713,15 @@ mod tests {
             vec![0]
         );
         assert!(gap.complete.is_none());
-        let complete = grouper.push(segment(3, base)).complete.unwrap();
+        assert!(grouper.push(segment(3, base)).complete.is_none());
+        assert!(grouper.push(segment(4, base)).complete.is_none());
+        let complete = grouper.push(segment(5, base)).complete.unwrap();
         assert_eq!(
             complete
                 .iter()
                 .map(|item| item.sequence)
                 .collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![2, 3, 4, 5]
         );
     }
 
@@ -1858,6 +1877,97 @@ mod tests {
         state.acknowledge_segment(&id).await.unwrap();
         assert!(!fs::try_exists(&media.path).await.unwrap());
         assert!(!state.segments.contains_key(&id));
+        drop(state);
+        fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn window_saturation_skips_derived_work_without_stopping_capture() {
+        let root = test_directory("window_saturation");
+        let segment_dir = root.join("segments").join("capture_20260813T040000000Z");
+        let clips_dir = root.join("clips");
+        fs::create_dir_all(&segment_dir).await.unwrap();
+        fs::create_dir_all(&clips_dir).await.unwrap();
+        let root_lock = acquire_capture_root_lock(&root).unwrap();
+        let base = DateTime::parse_from_rfc3339("2026-08-13T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let incoming = vec![segment(3, base), segment(4, base), segment(5, base)];
+        let segment_lifecycles = incoming
+            .iter()
+            .cloned()
+            .map(|media| {
+                (
+                    media.id.clone(),
+                    SegmentLifecycle {
+                        media,
+                        externally_acknowledged: false,
+                        assembled: false,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let retained_window = MediaWindow {
+            id: "window-0".to_owned(),
+            sequence: 0,
+            path: clips_dir.join("window_20260813T040000000Z_000000.mp4"),
+            segments: vec![segment(0, base), segment(1, base), segment(2, base)],
+            started_at_utc: base,
+            ended_at_utc: base + ChronoDuration::seconds(WINDOW_SECONDS as i64),
+            created_at_utc: base + ChronoDuration::seconds(WINDOW_SECONDS as i64),
+            duration_ms: WINDOW_SECONDS * 1_000,
+            size_bytes: 1,
+            inline_upload_safe: true,
+        };
+        let mut state = WorkerState {
+            config: CaptureConfig {
+                output_dir: root.clone(),
+                max_inflight_windows: 1,
+                ..CaptureConfig::default()
+            },
+            session_id: "capture_20260813T040000000Z".to_owned(),
+            capture_started_at_utc: base,
+            segment_dir,
+            clips_dir,
+            _root_lock: root_lock,
+            next_segment: 6,
+            next_window: 1,
+            grouper: SegmentGrouper::default(),
+            segments: segment_lifecycles,
+            windows: HashMap::from([(
+                retained_window.id.clone(),
+                WindowLifecycle {
+                    media: retained_window,
+                    acknowledged: false,
+                },
+            )]),
+        };
+        let (sender, mut receiver) = mpsc::channel(2);
+
+        state
+            .publish_window(incoming.clone(), &sender)
+            .await
+            .unwrap();
+
+        assert_eq!(state.next_window, 2);
+        assert_eq!(state.windows.len(), 1);
+        assert!(incoming.iter().all(|segment| {
+            state
+                .segments
+                .get(&segment.id)
+                .is_some_and(|lifecycle| lifecycle.assembled)
+        }));
+        let event = receiver
+            .try_recv()
+            .expect("a skip event should be observable");
+        assert!(matches!(
+            event,
+            CaptureEvent::Fault {
+                fatal: false,
+                message,
+                ..
+            } if message.contains("skipped")
+        ));
         drop(state);
         fs::remove_dir_all(&root).await.unwrap();
     }

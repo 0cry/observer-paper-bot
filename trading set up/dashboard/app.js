@@ -309,7 +309,6 @@
       sl: nullableNumber(pick(item, ["stop_loss", "sl", "effective_sl"])),
       t1: nullableNumber(pick(item, ["t1", "target_1", "target1"])),
       t2: nullableNumber(pick(item, ["t2", "target_2", "target2"])),
-      confidence: nullableNumber(pick(item, ["confidence_pct", "confidence"])),
       raw: item,
     };
   }
@@ -540,10 +539,8 @@
     els["signals-list"].innerHTML = signals.map((signal) => {
       const action = signalAction(pick(signal, ["action", "decision", "type"], "UNKNOWN"));
       const contract = pick(signal, ["contract", "symbol", "instrument", "option_name"], "No contract");
-      let confidence = nullableNumber(pick(signal, ["confidence_pct", "confidence", "score"]));
-      if (confidence !== null && confidence <= 1) confidence *= 100;
-      const accepted = boolean(pick(signal, ["accepted", "is_accepted"]), confidence !== null && confidence >= 65);
-      const reason = pick(signal, ["reason", "evidence", "summary", "rationale"], accepted ? "Accepted by the confidence gate." : "Signal observed; no trade action accepted.");
+      const accepted = boolean(pick(signal, ["accepted", "is_accepted"]), false);
+      const reason = pick(signal, ["reason", "evidence", "summary", "rationale"], accepted ? "Action applied after deterministic safety checks." : "Signal observed; no paper action applied.");
       const timestamp = pick(signal, ["timestamp", "created_at", "signal_at", "at"]);
       const actionClass = action.includes("ENTRY") ? "entry" : action.includes("EXIT") ? "exit" : action.includes("WATCH") ? "watch" : "";
       const shortAction = action.replace("PLACE_", "").replace("UPDATE_", "UPD ").slice(0, 6);
@@ -552,7 +549,7 @@
         <div class="signal-main">
           <div class="signal-title"><strong>${escapeHtml(contract)}</strong><time title="${escapeHtml(formatDateTime(timestamp))}">${escapeHtml(formatTime(timestamp))}</time></div>
           <p>${escapeHtml(reason)}</p>
-          <div class="signal-meta"><span class="confidence-badge ${accepted ? "accepted" : "rejected"}">${confidence === null ? "No score" : `${confidence.toFixed(0)}% confidence`}</span>${modeBadge(pick(signal, ["mode", "strategy"], "all"))}</div>
+          <div class="signal-meta"><span class="status-badge ${accepted ? "won" : "open"}">${accepted ? "Applied" : "Observed"}</span>${modeBadge(pick(signal, ["mode", "strategy"], "all"))}</div>
         </div>
       </li>`;
     }).join("");
@@ -851,7 +848,7 @@
     if (boolean(value, false) || ["running", "active", "success", "synced"].includes(lower)) {
       return { className: "is-good", label: detail || (lower === "true" ? "Online" : cleanText(value, "Online")) };
     }
-    if (["starting", "connecting", "degraded", "stale", "waiting", "idle", "warning"].some((word) => lower.includes(word))) return { className: "is-warn", label: detail || cleanText(value, "Waiting") };
+    if (["starting", "connecting", "recovering", "degraded", "stale", "waiting", "idle", "warning"].some((word) => lower.includes(word))) return { className: "is-warn", label: detail || cleanText(value, "Waiting") };
     return { className: "is-bad", label: detail || (lower === "false" ? "Offline" : cleanText(value, "Offline")) };
   }
 
@@ -1155,7 +1152,7 @@
       ["Entry price", formatNumber(trade.entryPrice)], ["Exit price", formatNumber(trade.exitPrice)], ["Net P&L", formatMoney(trade.pnl)],
       ["Charges", formatMoney(trade.charges)], ["Stop loss", formatNumber(trade.sl)], ["T1 / T2", `${formatNumber(trade.t1)} / ${formatNumber(trade.t2)}`],
       ["Opened", formatDateTime(trade.openedAt)], ["Closed", formatDateTime(trade.closedAt)], ["Duration", formatDuration(trade.duration)],
-      ["Exit reason", trade.exitReason], ["Gemini confidence", formatPercent(trade.confidence)], ["Underlying", trade.underlying],
+      ["Exit reason", trade.exitReason], ["Underlying", trade.underlying],
     ];
     els["trade-detail-grid"].innerHTML = details.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
     if (typeof els["trade-dialog"].showModal === "function") els["trade-dialog"].showModal();

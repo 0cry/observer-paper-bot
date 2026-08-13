@@ -98,7 +98,6 @@ pub struct TradeSetup {
     pub contract: OptionContract,
     pub side: TradeSide,
     pub levels: TradeLevels,
-    pub confidence_pct: u8,
     pub evidence_timestamp_ms: TimestampMs,
     pub received_timestamp_ms: TimestampMs,
 }
@@ -163,7 +162,6 @@ pub struct PaperBrokerConfig {
     pub entry_buffer_paise: Paise,
     pub entry_charge_paise: Paise,
     pub exit_charge_paise: Paise,
-    pub minimum_confidence_pct: u8,
     /// Maximum wall-clock lifetime of an unfilled entry order. The serde
     /// default keeps snapshots written before this setting was introduced
     /// restorable with the conservative 60-second lifetime.
@@ -180,7 +178,6 @@ impl Default for PaperBrokerConfig {
             entry_buffer_paise: rupees(2),
             entry_charge_paise: rupees(20),
             exit_charge_paise: rupees(20),
-            minimum_confidence_pct: 65,
             pending_entry_ttl_ms: DEFAULT_PENDING_ENTRY_TTL_MS,
             maximum_tick_age_ms: 5_000,
             maximum_future_skew_ms: 1_000,
@@ -258,7 +255,6 @@ pub struct PendingEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExitRequest {
-    pub confidence_pct: u8,
     pub requested_timestamp_ms: TimestampMs,
 }
 
@@ -309,7 +305,6 @@ pub struct ClosedTrade {
     pub opened_timestamp_ms: TimestampMs,
     pub closed_timestamp_ms: TimestampMs,
     pub exit_reason: ExitReason,
-    pub exit_confidence_pct: Option<u8>,
     pub maximum_ltp_paise: Paise,
     pub minimum_ltp_paise: Paise,
     pub final_sl_paise: Paise,
@@ -659,7 +654,7 @@ impl PaperBroker {
             validate_trading_date_ist(date)?;
         }
 
-        validate_setup_registry(&self.setup_registry, &self.config)?;
+        validate_setup_registry(&self.setup_registry)?;
         validate_latest_ticks(&self.latest_ticks)?;
         validate_event_buffer(
             &self.events,
@@ -772,7 +767,7 @@ impl PaperBroker {
             };
         }
 
-        if let Some(reason) = validate_setup(&setup, &self.config) {
+        if let Some(reason) = validate_setup(&setup) {
             let event = self.commit_event(EventDraft {
                 setup_id: Some(setup_id.clone()),
                 instrument_id: Some(setup.contract.instrument_id.clone()),
@@ -1376,11 +1371,6 @@ fn validate_config(config: &PaperBrokerConfig) -> Result<(), PaperError> {
             "charges cannot be negative".to_string(),
         ));
     }
-    if config.minimum_confidence_pct > 100 {
-        return Err(PaperError::InvalidConfig(
-            "minimum confidence cannot exceed 100".to_string(),
-        ));
-    }
     if config.pending_entry_ttl_ms <= 0 {
         return Err(PaperError::InvalidConfig(
             "pending entry TTL must be positive".to_string(),
@@ -1427,10 +1417,7 @@ fn validate_trading_date_ist(value: &str) -> Result<(), PaperError> {
     Ok(())
 }
 
-fn validate_setup_registry(
-    registry: &BTreeMap<String, TradeSetup>,
-    config: &PaperBrokerConfig,
-) -> Result<(), PaperError> {
+fn validate_setup_registry(registry: &BTreeMap<String, TradeSetup>) -> Result<(), PaperError> {
     for (setup_id, setup) in registry {
         if setup_id.trim().is_empty() || setup_id != &setup.setup_id || setup_id != setup_id.trim()
         {
@@ -1438,7 +1425,7 @@ fn validate_setup_registry(
                 "setup registry key/id mismatch for {setup_id:?}"
             )));
         }
-        if let Some(reason) = validate_setup(setup, config) {
+        if let Some(reason) = validate_setup(setup) {
             return Err(invalid_state(format!(
                 "invalid accepted setup {setup_id}: {reason}"
             )));
@@ -1617,8 +1604,6 @@ fn validate_account_state(
         }
         if let Some(request) = &position.llm_exit_request {
             if mode != ShadowMode::LlmExit
-                || request.confidence_pct < config.minimum_confidence_pct
-                || request.confidence_pct > 100
                 || request.requested_timestamp_ms < position.opened_timestamp_ms
             {
                 return Err(invalid_state(format!(
@@ -1680,21 +1665,6 @@ fn validate_account_state(
         if trade.gross_pnl_paise != gross || trade.net_pnl_paise != net {
             return Err(invalid_state(format!("P/L mismatch in {context}")));
         }
-        match (trade.exit_reason, trade.exit_confidence_pct) {
-            (ExitReason::Llm, Some(confidence))
-                if confidence >= config.minimum_confidence_pct && confidence <= 100 => {}
-            (ExitReason::Llm, _) => {
-                return Err(invalid_state(format!(
-                    "LLM exit confidence is invalid in {context}"
-                )));
-            }
-            (_, None) => {}
-            (_, Some(_)) => {
-                return Err(invalid_state(format!(
-                    "non-LLM exit carries confidence in {context}"
-                )));
-            }
-        }
         if trade_ids.insert(trade.trade_id.clone(), ()).is_some()
             || closed_setup_ids
                 .insert(trade.setup_id.clone(), trade.trade_id.clone())
@@ -1750,7 +1720,7 @@ fn validate_account_state(
     Ok(())
 }
 
-fn validate_setup(setup: &TradeSetup, config: &PaperBrokerConfig) -> Option<String> {
+fn validate_setup(setup: &TradeSetup) -> Option<String> {
     if setup.contract.instrument_id.trim().is_empty() {
         return Some("instrument_id cannot be empty".to_string());
     }
@@ -1765,15 +1735,6 @@ fn validate_setup(setup: &TradeSetup, config: &PaperBrokerConfig) -> Option<Stri
     }
     if setup.side != TradeSide::Buy {
         return Some("v1 accepts BUY option trades only".to_string());
-    }
-    if setup.confidence_pct < config.minimum_confidence_pct {
-        return Some(format!(
-            "confidence {} is below required {}",
-            setup.confidence_pct, config.minimum_confidence_pct
-        ));
-    }
-    if setup.confidence_pct > 100 {
-        return Some("confidence cannot exceed 100".to_string());
     }
     if setup.levels.entry_paise <= 0
         || setup.levels.hard_sl_paise <= 0
@@ -1834,26 +1795,7 @@ impl PaperBroker {
     /// Queues an explicit LLM exit for the LLM-managed shadow only.  The
     /// moving-SL shadow intentionally ignores this request.  Execution occurs
     /// on the next accepted fresh tick for the instrument.
-    pub fn request_llm_exit(
-        &mut self,
-        setup_id: &str,
-        confidence_pct: u8,
-        now_ms: TimestampMs,
-    ) -> Vec<BrokerEvent> {
-        if confidence_pct < self.config.minimum_confidence_pct || confidence_pct > 100 {
-            return vec![self.commit_event(EventDraft {
-                setup_id: Some(setup_id.to_string()),
-                ..EventDraft::simple(
-                    now_ms,
-                    EventType::LlmExitRejected,
-                    format!(
-                        "LLM exit confidence {confidence_pct} does not meet required {}",
-                        self.config.minimum_confidence_pct
-                    ),
-                )
-            })];
-        }
-
+    pub fn request_llm_exit(&mut self, setup_id: &str, now_ms: TimestampMs) -> Vec<BrokerEvent> {
         let mut drafts = Vec::new();
         let book = self
             .books
@@ -1862,7 +1804,6 @@ impl PaperBroker {
         for account in book.accounts.values_mut() {
             if let Some(position) = account.open_positions.get_mut(setup_id) {
                 position.llm_exit_request = Some(ExitRequest {
-                    confidence_pct,
                     requested_timestamp_ms: now_ms,
                 });
                 drafts.push(EventDraft {
@@ -1876,7 +1817,7 @@ impl PaperBroker {
                     price_paise: None,
                     amount_paise: None,
                     exit_reason: Some(ExitReason::Llm),
-                    message: format!("qualified LLM exit queued at {confidence_pct}% confidence"),
+                    message: "explicit LLM exit queued from current evidence".to_owned(),
                 });
             }
         }
@@ -2190,7 +2131,7 @@ impl PaperBroker {
 
                 for setup_id in position_ids {
                     let mut stop_event = None;
-                    let (exit_reason, exit_confidence) = {
+                    let exit_reason = {
                         let position = account
                             .open_positions
                             .get_mut(&setup_id)
@@ -2242,14 +2183,14 @@ impl PaperBroker {
                         }
 
                         if eod_at.is_some_and(|at| tick.exchange_timestamp_ms >= at) {
-                            (Some(ExitReason::EndOfDay), None)
+                            Some(ExitReason::EndOfDay)
                         } else if tick.ltp_paise <= position.effective_sl_paise {
                             if mode == ShadowMode::MovingSl
                                 && position.effective_sl_paise > position.levels.hard_sl_paise
                             {
-                                (Some(ExitReason::MovingStop), None)
+                                Some(ExitReason::MovingStop)
                             } else {
-                                (Some(ExitReason::HardStop), None)
+                                Some(ExitReason::HardStop)
                             }
                         } else if mode == ShadowMode::LlmExit {
                             match &position.llm_exit_request {
@@ -2257,12 +2198,12 @@ impl PaperBroker {
                                     if tick.received_timestamp_ms
                                         >= request.requested_timestamp_ms =>
                                 {
-                                    (Some(ExitReason::Llm), Some(request.confidence_pct))
+                                    Some(ExitReason::Llm)
                                 }
-                                Some(_) | None => (None, None),
+                                Some(_) | None => None,
                             }
                         } else {
-                            (None, None)
+                            None
                         }
                     };
 
@@ -2301,7 +2242,6 @@ impl PaperBroker {
                             opened_timestamp_ms: position.opened_timestamp_ms,
                             closed_timestamp_ms: tick.exchange_timestamp_ms,
                             exit_reason: reason,
-                            exit_confidence_pct: exit_confidence,
                             maximum_ltp_paise: position.maximum_ltp_paise,
                             minimum_ltp_paise: position.minimum_ltp_paise,
                             final_sl_paise: position.effective_sl_paise,
@@ -2424,7 +2364,6 @@ mod tests {
                 t1_paise: rupees(12),
                 t2_paise: Some(rupees(15)),
             },
-            confidence_pct: 65,
             evidence_timestamp_ms,
             received_timestamp_ms: evidence_timestamp_ms + 20_000,
         }
@@ -2437,6 +2376,38 @@ mod tests {
             exchange_timestamp_ms: timestamp_ms,
             received_timestamp_ms: timestamp_ms,
         }
+    }
+
+    #[test]
+    fn new_paper_payloads_are_confidence_free() {
+        let mut setup_json = serde_json::to_value(setup(
+            "confidence-free",
+            "NIFTY-A",
+            Underlying::Nifty,
+            BASE_TIME,
+        ))
+        .unwrap();
+        let mut config_json = serde_json::to_value(PaperBrokerConfig::default()).unwrap();
+
+        assert!(setup_json.get("confidence_pct").is_none());
+        assert!(config_json.get("minimum_confidence_pct").is_none());
+
+        setup_json["confidence_pct"] = serde_json::json!(65);
+        config_json["minimum_confidence_pct"] = serde_json::json!(65);
+        let restored_setup: TradeSetup = serde_json::from_value(setup_json).unwrap();
+        let restored_config: PaperBrokerConfig = serde_json::from_value(config_json).unwrap();
+        assert!(
+            serde_json::to_value(restored_setup)
+                .unwrap()
+                .get("confidence_pct")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(restored_config)
+                .unwrap()
+                .get("minimum_confidence_pct")
+                .is_none()
+        );
     }
 
     fn one_account_broker(capital_rupees: i64) -> PaperBroker {
@@ -2555,20 +2526,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sell_low_confidence_and_invalid_buy_levels() {
+    fn rejects_sell_and_invalid_buy_levels() {
         let mut broker = one_account_broker(5_000);
 
         let mut sell = setup("sell", "NIFTY-A", Underlying::Nifty, BASE_TIME);
         sell.side = TradeSide::Sell;
         assert_eq!(
             broker.place_setup(sell, BASE_TIME).status,
-            PlacementStatus::Rejected
-        );
-
-        let mut low_confidence = setup("low", "NIFTY-A", Underlying::Nifty, BASE_TIME);
-        low_confidence.confidence_pct = 64;
-        assert_eq!(
-            broker.place_setup(low_confidence, BASE_TIME).status,
             PlacementStatus::Rejected
         );
 
@@ -2972,20 +2936,7 @@ mod tests {
             BASE_TIME + 100,
         );
 
-        let rejected = broker.request_llm_exit("llm-exit", 64, BASE_TIME + 110);
-        assert_eq!(rejected[0].event_type, EventType::LlmExitRejected);
-        broker.on_tick(
-            tick("NIFTY-A", rupees(11), BASE_TIME + 120),
-            BASE_TIME + 120,
-        );
-        assert_eq!(
-            account_snapshot(&broker, ShadowMode::LlmExit, BASE_TIME + 120)
-                .open_positions
-                .len(),
-            1
-        );
-
-        broker.request_llm_exit("llm-exit", 65, BASE_TIME + 130);
+        broker.request_llm_exit("llm-exit", BASE_TIME + 130);
         let exit_tick = broker.on_tick(
             tick("NIFTY-A", rupees(11) + 50, BASE_TIME + 140),
             BASE_TIME + 140,
@@ -2996,7 +2947,6 @@ mod tests {
         let moving = account_snapshot(&broker, ShadowMode::MovingSl, BASE_TIME + 140);
         assert!(llm.open_positions.is_empty());
         assert_eq!(llm.closed_trades[0].exit_reason, ExitReason::Llm);
-        assert_eq!(llm.closed_trades[0].exit_confidence_pct, Some(65));
         assert_eq!(moving.open_positions.len(), 1);
         assert!(moving.closed_trades.is_empty());
     }
@@ -3017,7 +2967,7 @@ mod tests {
             tick("NIFTY-A", rupees(10), BASE_TIME + 100),
             BASE_TIME + 100,
         );
-        broker.request_llm_exit("llm-exit-time-gate", 65, BASE_TIME + 200);
+        broker.request_llm_exit("llm-exit-time-gate", BASE_TIME + 200);
 
         let replayed = MarketTick {
             instrument_id: "NIFTY-A".to_string(),
@@ -3467,7 +3417,7 @@ mod tests {
             tick("NIFTY-A", rupees(10), BASE_TIME + 100),
             BASE_TIME + 100,
         );
-        broker.request_llm_exit("events", 65, BASE_TIME + 110);
+        broker.request_llm_exit("events", BASE_TIME + 110);
         broker.on_tick(
             tick("NIFTY-A", rupees(11), BASE_TIME + 120),
             BASE_TIME + 120,

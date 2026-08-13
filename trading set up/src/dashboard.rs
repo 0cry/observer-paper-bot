@@ -261,7 +261,6 @@ pub struct PendingOrderView {
     #[serde(rename = "ltp", alias = "current_ltp")]
     pub current_ltp: Option<f64>,
     pub reserved_cash: f64,
-    pub confidence_pct: f64,
     pub status: String,
     pub created_at: String,
     pub expires_at: Option<String>,
@@ -290,7 +289,6 @@ pub struct SignalView {
     pub stop_loss: Option<f64>,
     pub target_1: Option<f64>,
     pub target_2: Option<f64>,
-    pub confidence_pct: f64,
     pub market_bias: String,
     pub source_age_ms: Option<u64>,
     pub freshness: String,
@@ -344,7 +342,6 @@ pub struct HistoryTrade {
     pub charges: f64,
     pub net_pnl: f64,
     pub return_pct: f64,
-    pub confidence_pct: f64,
     pub max_favorable_price: f64,
     pub max_adverse_price: f64,
     pub notes: String,
@@ -826,8 +823,6 @@ pub struct HistoryQuery {
     pub to: Option<String>,
     pub min_pnl: Option<f64>,
     pub max_pnl: Option<f64>,
-    pub min_confidence: Option<f64>,
-    pub max_confidence: Option<f64>,
     pub sort: Option<String>,
     pub order: Option<String>,
     pub page: Option<usize>,
@@ -975,16 +970,6 @@ fn filtered_history(
         .filter(|trade| outcome_matches(trade, query.outcome.as_deref()))
         .filter(|trade| query.min_pnl.is_none_or(|value| trade.net_pnl >= value))
         .filter(|trade| query.max_pnl.is_none_or(|value| trade.net_pnl <= value))
-        .filter(|trade| {
-            query
-                .min_confidence
-                .is_none_or(|value| trade.confidence_pct >= value)
-        })
-        .filter(|trade| {
-            query
-                .max_confidence
-                .is_none_or(|value| trade.confidence_pct <= value)
-        })
         .filter(|trade| search_matches(trade, query.search.as_deref()))
         .filter(|trade| {
             if from.is_none() && to.is_none() {
@@ -1169,7 +1154,6 @@ fn sort_history(
             "entry_price" => left.entry_price.total_cmp(&right.entry_price),
             "exit_price" => left.exit_price.total_cmp(&right.exit_price),
             "return_pct" => left.return_pct.total_cmp(&right.return_pct),
-            "confidence" | "confidence_pct" => left.confidence_pct.total_cmp(&right.confidence_pct),
             "hold_seconds" | "duration_seconds" => left.hold_seconds.cmp(&right.hold_seconds),
             "quantity" => left.quantity.cmp(&right.quantity),
             "symbol" | "contract" => left.symbol.to_lowercase().cmp(&right.symbol.to_lowercase()),
@@ -1205,8 +1189,6 @@ fn sort_history(
             | "entry_price"
             | "exit_price"
             | "return_pct"
-            | "confidence"
-            | "confidence_pct"
             | "hold_seconds"
             | "duration_seconds"
             | "quantity"
@@ -1323,7 +1305,6 @@ fn history_csv(history: &[HistoryTrade]) -> Result<Vec<u8>, ApiError> {
             "charges",
             "net_pnl",
             "return_pct",
-            "confidence_pct",
             "max_favorable_price",
             "max_adverse_price",
             "notes",
@@ -1364,7 +1345,6 @@ fn history_csv(history: &[HistoryTrade]) -> Result<Vec<u8>, ApiError> {
                 trade.charges.to_string(),
                 trade.net_pnl.to_string(),
                 trade.return_pct.to_string(),
-                trade.confidence_pct.to_string(),
                 trade.max_favorable_price.to_string(),
                 trade.max_adverse_price.to_string(),
                 csv_safe(&trade.notes),
@@ -1555,7 +1535,6 @@ mod tests {
         symbol: &str,
         closed_at: &str,
         pnl: f64,
-        confidence: f64,
     ) -> HistoryTrade {
         HistoryTrade {
             trade_id: id.to_owned(),
@@ -1577,7 +1556,6 @@ mod tests {
             gross_pnl: pnl + 40.0,
             charges: 40.0,
             return_pct: pnl / 100.0,
-            confidence_pct: confidence,
             hold_seconds: 120,
             ..HistoryTrade::default()
         }
@@ -1592,7 +1570,6 @@ mod tests {
                 "NIFTY-25000-CE",
                 "2026-08-11T05:00:00Z",
                 100.0,
-                72.0,
             ),
             trade(
                 "t2",
@@ -1601,7 +1578,6 @@ mod tests {
                 "SENSEX-80000-PE",
                 "2026-08-11T06:00:00Z",
                 -50.0,
-                80.0,
             ),
             trade(
                 "t3",
@@ -1610,7 +1586,6 @@ mod tests {
                 "NIFTY-25100-PE",
                 "2026-08-12T05:00:00Z",
                 200.0,
-                68.0,
             ),
             trade(
                 "t4",
@@ -1619,9 +1594,35 @@ mod tests {
                 "NIFTY-25200-CE",
                 "2026-08-12T06:00:00Z",
                 0.0,
-                66.0,
             ),
         ]
+    }
+
+    #[test]
+    fn dashboard_payloads_ignore_legacy_confidence_fields_and_do_not_reemit_them() {
+        let signal: SignalView = serde_json::from_value(serde_json::json!({
+            "signal_id": "legacy-signal",
+            "confidence_pct": 80
+        }))
+        .unwrap();
+        let history: HistoryTrade = serde_json::from_value(serde_json::json!({
+            "trade_id": "legacy-trade",
+            "confidence_pct": 80
+        }))
+        .unwrap();
+
+        assert!(
+            serde_json::to_value(signal)
+                .unwrap()
+                .get("confidence_pct")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(history)
+                .unwrap()
+                .get("confidence_pct")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1629,7 +1630,7 @@ mod tests {
         let query = HistoryQuery {
             account: Some("5k".to_owned()),
             underlying: Some("nifty".to_owned()),
-            min_confidence: Some(67.0),
+            outcome: Some("win".to_owned()),
             sort: Some("net_pnl".to_owned()),
             order: Some("desc".to_owned()),
             page: Some(1),
@@ -1720,7 +1721,6 @@ mod tests {
             "NIFTY-25000-CE",
             "2026-08-11T05:00:00Z",
             100.0,
-            72.0,
         );
         item.notes = "=HYPERLINK(\"https://bad.invalid\")".to_owned();
         let bytes = history_csv(&[item]).unwrap();

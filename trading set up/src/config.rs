@@ -24,7 +24,7 @@ pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 pub const DEFAULT_PAPER_ACCOUNTS: &str =
     "account_1:5000,account_2:10000,account_3:2000,account_4:15000,account_5:20000";
 pub const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:8787";
-pub const DEFAULT_GEMINI_KEY_NAMES: &str = "GEMINI_WORKING_01,GEMINI_WORKING_02,GEMINI_WORKING_03";
+pub const DEFAULT_GEMINI_KEY_NAMES: &str = "GEMINI_WORKING_01";
 pub const DEFAULT_API_KEY_LIMIT: usize = 3;
 
 /// A secret that is redacted both in debug output and Serde serialization.
@@ -120,7 +120,6 @@ pub struct LotSizeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TradingConfig {
-    pub minimum_confidence_pct: f64,
     pub entry_buffer_points: f64,
     pub candidate_ttl_seconds: u64,
     pub charge_per_fill_rupees: f64,
@@ -259,7 +258,6 @@ impl AppConfig {
                 sensex: parse_or(values, "SENSEX_LOT_SIZE", 20)?,
             },
             trading: TradingConfig {
-                minimum_confidence_pct: parse_or(values, "MIN_TRADE_CONFIDENCE", 65.0)?,
                 entry_buffer_points: parse_or(values, "ENTRY_BUFFER_POINTS", 2.0)?,
                 candidate_ttl_seconds: parse_or(values, "CANDIDATE_TTL_SECONDS", 10)?,
                 charge_per_fill_rupees: parse_or(values, "CHARGE_PER_FILL", 20.0)?,
@@ -377,11 +375,6 @@ impl AppConfig {
         if self.lot_sizes.nifty > 10_000 || self.lot_sizes.sensex > 10_000 {
             bail!("lot sizes must not exceed 10000");
         }
-        if !self.trading.minimum_confidence_pct.is_finite()
-            || !(0.0..=100.0).contains(&self.trading.minimum_confidence_pct)
-        {
-            bail!("MIN_TRADE_CONFIDENCE must be between 0 and 100");
-        }
         if !self.trading.entry_buffer_points.is_finite() || self.trading.entry_buffer_points < 0.0 {
             bail!("ENTRY_BUFFER_POINTS must be a finite non-negative number");
         }
@@ -465,27 +458,15 @@ fn parse_market_holidays(value: &str) -> Result<Vec<NaiveDate>> {
 }
 
 fn configured_gemini_keys(values: &BTreeMap<String, String>) -> Result<Vec<SecretString>> {
-    let mut raw_keys = (1..=16)
-        .filter_map(|index| get(values, &format!("GEMINI_API_KEY_{index}")))
+    let primary = get(values, "GEMINI_API_KEY_1")
+        .or_else(|| get(values, "GEMINI_API_KEY"))
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-
-    if raw_keys.is_empty()
-        && let Some(legacy) = get(values, "GEMINI_API_KEY").filter(|value| !value.trim().is_empty())
-    {
-        raw_keys.push(legacy.to_owned());
-    }
-    if raw_keys.is_empty() {
-        bail!("GEMINI_API_KEY is required and must not be empty (GEMINI_API_KEY_1 is preferred)");
-    }
-
-    let mut seen = HashSet::new();
-    raw_keys
-        .into_iter()
-        .filter(|key| seen.insert(key.clone()))
-        .map(SecretString::new)
-        .collect()
+        .ok_or_else(|| {
+            anyhow!(
+                "GEMINI_API_KEY is required and must not be empty (GEMINI_API_KEY_1 is preferred)"
+            )
+        })?;
+    Ok(vec![SecretString::new(primary.to_owned())?])
 }
 
 fn configured_provider_keys(
@@ -841,7 +822,6 @@ mod tests {
                 sensex: 20
             }
         );
-        assert_eq!(config.trading.minimum_confidence_pct, 65.0);
         assert_eq!(config.trading.entry_buffer_points, 2.0);
         assert_eq!(config.trading.candidate_ttl_seconds, 10);
         assert_eq!(config.trading.charge_per_fill_rupees, 20.0);
@@ -851,6 +831,18 @@ mod tests {
         );
         assert_eq!(config.media.clips_to_keep, 3);
         assert_eq!(config.dashboard.bind.to_string(), "127.0.0.1:8787");
+    }
+
+    #[test]
+    fn gemini_uses_only_primary_key_slot() {
+        let config = config_with(&[
+            ("GEMINI_API_KEY_1", "primary-key"),
+            ("GEMINI_API_KEY_2", "fallback-key"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.gemini.api_keys.len(), 1);
+        assert_eq!(config.gemini.api_keys[0].expose_secret(), "primary-key");
     }
 
     #[test]
@@ -879,7 +871,6 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_or_impossible_values() {
-        assert!(config_with(&[("MIN_TRADE_CONFIDENCE", "101")]).is_err());
         assert!(config_with(&[("STT_CONCURRENCY", "0")]).is_err());
         assert!(config_with(&[("PAPER_ACCOUNTS", "same:5000,same:10000")]).is_err());
         assert!(config_with(&[("DASHBOARD_BIND", "127.0.0.1:0")]).is_err());

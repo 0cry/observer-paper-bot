@@ -9,21 +9,27 @@ This project is **paper-only**. It reads market data but contains no broker orde
 The `paper` command runs the complete pipeline:
 
 1. `yt-dlp` resolves the stream's current playback URL. A long-running FFmpeg process begins at the current live edge; it does not replay the stream from the beginning.
-2. FFmpeg closes an exact 4-second MPEG-TS segment at a time. ElevenLabs Scribe v2 transcribes each segment, with bounded concurrency.
-3. Every two consecutive segments are remuxed into one 8-second MP4. Gemini receives that clip, the two timestamped transcript chunks, prompt-send time/data age, watched option LTPs, and any open LLM-managed trades.
-4. Gemini returns strict structured actions such as watch, place entry, update levels, cancel, hold, or exit. The paper broker rejects trade and exit instructions below the configured confidence threshold.
+2. FFmpeg closes an exact 5-second MPEG-TS segment at a time. ElevenLabs Scribe v2 transcribes each segment, with bounded concurrency.
+3. Every four consecutive segments are encoded into one exact 20-second, 720p MP4. Gemini receives that clip, the four timestamped transcript chunks, prompt-send time/data age, watched option LTPs, and authoritative paper-broker state.
+4. Gemini gives video and transcript equal evidentiary weight and returns strict structured actions such as watch, place entry, update levels, cancel, hold, or exit. Unresolved conflicts between the two sources block executable actions.
 5. Candidate, pending, and open contracts drive dynamic INDstocks subscriptions. Fresh ticks fill paper orders, update P/L, advance mechanical stops, and close positions.
 6. State, audit events, trade history, and dashboard views are updated continuously. At the configured IST end-of-day time, pending entries are cancelled and open positions close on their first fresh tick at or after the cutoff.
 
-Completed clips are retained under `data/media/clips/`; with the default `CLIPS_TO_KEEP=3`, acknowledged older clips are deleted. Temporary 4-second segments are removed after transcription and window assembly acknowledge them.
+Completed clips are retained under `data/media/clips/`; with the default `CLIPS_TO_KEEP=3`, acknowledged older clips are deleted. Temporary 5-second segments are removed after transcription and window assembly acknowledge them.
 
 ## Rolling multimodal context
 
-Every 8-second Gemini response includes a complete, bounded context snapshot: a detailed spoken summary, detailed visual summary, combined summary, structured key visual points, and active trade episodes. The runtime feeds that snapshot into the next Gemini call in FIFO order, so contracts, stated levels, and episode state can carry across a long stream without an ever-growing transcript.
+Every 20-second Gemini response includes a complete, bounded context snapshot: a detailed spoken summary, detailed visual summary, combined summary, structured key visual points, active trade episodes, and the bot outcomes already confirmed by the paper broker. The runtime keeps one analysis active and at most one newest window pending. If the provider is slower than the stream, a newer pending window supersedes the older raw clip while the committed episode and broker state remain authoritative. This prevents stale FIFO lag without creating an ever-growing transcript.
 
-The latest snapshot is stored in `data/paper/stream_context.json` and is restored only when its stream URL and IST trading date match the current run. Earlier context may preserve contract identity and explicitly stated levels, but it is not fresh evidence and cannot trigger an order by itself; actionable commands still require evidence from the current 8-second window. All resulting execution remains paper-only.
+Superseded clips are acknowledged immediately for retention cleanup. If the capture worker reaches its derived-window in-flight limit, it skips that analysis window and continues FFmpeg at the live edge instead of terminating the stream. Skipped observations are recorded as degraded health and can never authorize a new entry.
 
-Gemini credentials form one unnamed shared round-robin pool (`GEMINI_API_KEY_1` through `GEMINI_API_KEY_16`). Quota, authentication, transport, timeout, and server failures cool down the affected slot and retry the same window with another healthy key. Per-slot health is exposed without revealing credential values.
+If FFmpeg or the capture worker fails unexpectedly, the runtime keeps live market ticks, paper positions, stops, targets, persistence, and the dashboard running while it reconnects capture at the current edge. Retries use one background single-flight supervisor with capped delays of 2, 4, 8, 16, then 30 seconds. Confirmed end-of-stream and requested shutdown events do not restart. Each restarted capture receives a new internal generation so late transcription or Gemini completions from an older worker cannot collide with new segment/window sequences.
+
+The latest snapshot is stored in `data/paper/stream_context.json` and is restored only when its stream URL and IST trading date match the current run. Earlier context may preserve contract identity and explicitly stated levels, but it is not fresh evidence and cannot trigger an order by itself; actionable commands still require evidence from the current 20-second window. Rust overwrites model-authored execution claims with actual pending, filled, rejected, cancelled, updated, or closed paper outcomes before the next request. All resulting execution remains paper-only.
+
+Gemini uses only `GEMINI_API_KEY_1`. Requests never run concurrently, and the application does not impose a Gemini reasoning/request deadline; an active request runs until the provider completes, returns an error, or the runtime shuts down. Every completed or failed analysis records its measured `latency_ms` in the session audit log.
+
+ElevenLabs also keeps one active key while it succeeds and moves to an eligible fallback only after that key fails or enters cooldown. One five-second segment may try at most two distinct credential slots, one provider attempt is capped at four seconds, and the whole segment—including semaphore queue time—is capped at six seconds. Later credentials remain available for newer segments instead of being exhausted by obsolete audio. Missing transcription is represented explicitly and cannot make a stale window actionable.
 
 ## Requirements
 
@@ -74,7 +80,6 @@ GEMINI_MODEL=gemini-3.5-flash-lite
 PAPER_ACCOUNTS=account_1:5000,account_2:10000,account_3:2000,account_4:15000,account_5:20000
 NIFTY_LOT_SIZE=65
 SENSEX_LOT_SIZE=20
-MIN_TRADE_CONFIDENCE=65
 ENTRY_BUFFER_POINTS=2
 CLIPS_TO_KEEP=3
 STT_CONCURRENCY=4
@@ -149,7 +154,7 @@ Press `Ctrl+C` to stop a foreground run. For a finite diagnostic run, add `--dur
 
 The default wallets are INR 5,000, 10,000, 2,000, 15,000, and 20,000. Each accepted setup is independently simulated in both strategy books for every account:
 
-- `LLM_EXIT`: keeps the streamer's hard stop active and allows a confidence-qualified Gemini exit instruction. The exit executes on the next accepted fresh tick.
+- `LLM_EXIT`: keeps the streamer's hard stop active and allows an explicit current-evidence Gemini exit instruction. The exit executes on the next accepted fresh tick.
 - `MOVING_SL`: ignores LLM exit requests and follows the deterministic phase trail below.
 
 Each account uses the maximum number of whole lots that fits its free cash while reserving entry and exit charges. Accounts that cannot afford one complete lot do not receive that order. NIFTY uses 65 units per lot; SENSEX uses 20.
@@ -197,8 +202,8 @@ The dashboard binds only to localhost by default. Change `DASHBOARD_BIND` delibe
 - `data/paper/trade_history.json` — cumulative, deduplicated closed-trade history
 - `data/paper/stream_context.json` — bounded rolling multimodal context, scoped to the exact stream URL and IST trading date
 - `data/paper/sessions/paper_<UTC timestamp>/events.jsonl` — per-run pipeline audit and broker events
-- `data/media/clips/` — retained 8-second MP4 windows
-- `data/media/segments/<session>/` — temporary exact 4-second capture segments
+- `data/media/clips/` — retained 20-second 720p MP4 windows
+- `data/media/segments/<session>/` — temporary exact 5-second capture segments
 - `data/logs/paper_<timestamp>.stdout.log` and `.stderr.log` — background-launch logs
 - `data/runtime/paper_process.json` — background PID, start time, stream URL, and log paths
 

@@ -20,14 +20,14 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
-    time::{Instant, MissedTickBehavior, interval, sleep_until},
+    time::{Instant, MissedTickBehavior, interval, sleep, sleep_until},
 };
 
 use crate::{
     InstrumentRow, TokenManager,
     capture::{
-        CaptureConfig, CaptureEvent, CaptureSession, MediaSegment, MediaWindow, SEGMENT_SECONDS,
-        WINDOW_SECONDS, WINDOW_SEGMENTS,
+        CaptureConfig, CaptureController, CaptureEvent, CaptureSession, CaptureStopReason,
+        MediaSegment, MediaWindow, SEGMENT_SECONDS, WINDOW_SECONDS, WINDOW_SEGMENTS,
     },
     config::AppConfig,
     dashboard::{
@@ -37,9 +37,10 @@ use crate::{
     },
     fetch_instruments,
     gemini::{
-        self, ActionKind, AnalysisInput, ClipWindow, ExitMode, GeminiClient, GeminiClientConfig,
-        OptionType as GeminiOptionType, PriceSnapshot, TradeAction, TradeDirection,
-        Underlying as GeminiUnderlying, ValidatedAnalysis, WatchedOptionSnapshot,
+        self, ActionKind, AnalysisInput, BotActionOutcome, BotActionStatus, BotStateSnapshot,
+        ClipWindow, ExitMode, GeminiClient, GeminiClientConfig, OptionType as GeminiOptionType,
+        PriceSnapshot, TradeAction, TradeDirection, Underlying as GeminiUnderlying,
+        ValidatedAnalysis, WatchedOptionSnapshot,
     },
     market_feed::{
         FeedConnectionState, LatestTicks, MarketFeedConfig, MarketFeedHandle, ResolvedInstrument,
@@ -68,9 +69,11 @@ const MIN_CANDIDATE_OBSERVATION_SECONDS: u64 = 10;
 const CANDIDATE_RENEW_AHEAD_SECONDS: u64 = 2;
 const MAX_SIGNALS: usize = 500;
 const MAX_EQUITY_POINTS: usize = 10_000;
-const STREAM_CONTEXT_SCHEMA_VERSION: u32 = 1;
+const STREAM_CONTEXT_SCHEMA_VERSION: u32 = 2;
 const MAX_STREAM_CONTEXT_FILE_BYTES: u64 = 64 * 1024;
 const MAX_EXECUTABLE_SIGNAL_AGE_MS: i64 = 45_000;
+const CAPTURE_RESTART_INITIAL_DELAY: Duration = Duration::from_secs(2);
+const CAPTURE_RESTART_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct RoutedContract {
@@ -84,6 +87,171 @@ struct CandidateWatch {
     lease: SubscriptionLease,
     watched_since: Instant,
     watched_since_timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct CaptureRestartBackoff {
+    next: Duration,
+}
+
+impl Default for CaptureRestartBackoff {
+    fn default() -> Self {
+        Self {
+            next: CAPTURE_RESTART_INITIAL_DELAY,
+        }
+    }
+}
+
+impl CaptureRestartBackoff {
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(CAPTURE_RESTART_MAX_DELAY);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next = CAPTURE_RESTART_INITIAL_DELAY;
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct CaptureRecoveryState {
+    backoff: CaptureRestartBackoff,
+    pending: bool,
+    restart_count: u64,
+}
+
+impl CaptureRecoveryState {
+    fn schedule(&mut self) -> Option<Duration> {
+        if self.pending {
+            return None;
+        }
+        self.pending = true;
+        Some(self.backoff.next_delay())
+    }
+
+    fn finish(&mut self, success: bool) {
+        self.pending = false;
+        if success {
+            self.restart_count = self.restart_count.saturating_add(1);
+            self.backoff.reset();
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.pending = false;
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    fn restart_count(&self) -> u64 {
+        self.restart_count
+    }
+}
+
+fn capture_stop_should_restart(reason: CaptureStopReason) -> bool {
+    matches!(reason, CaptureStopReason::ControllerDropped)
+}
+
+fn qualify_capture_sequence(generation: u32, local_sequence: u64) -> Option<u64> {
+    (local_sequence <= u64::from(u32::MAX))
+        .then_some((u64::from(generation) << 32) | local_sequence)
+}
+
+fn capture_local_sequence(sequence: u64) -> u64 {
+    sequence & u64::from(u32::MAX)
+}
+
+fn capture_sequence_generation(sequence: u64) -> u32 {
+    (sequence >> 32) as u32
+}
+
+fn qualify_segment(generation: u32, segment: &mut MediaSegment) -> Result<()> {
+    segment.sequence = qualify_capture_sequence(generation, segment.sequence)
+        .ok_or_else(|| anyhow!("capture-local segment sequence exceeded 32-bit range"))?;
+    Ok(())
+}
+
+fn qualify_window(generation: u32, window: &mut MediaWindow) -> Result<()> {
+    window.sequence = qualify_capture_sequence(generation, window.sequence)
+        .ok_or_else(|| anyhow!("capture-local window sequence exceeded 32-bit range"))?;
+    for segment in &mut window.segments {
+        qualify_segment(generation, segment)?;
+    }
+    Ok(())
+}
+
+struct CaptureRestartCompleted {
+    result: std::result::Result<CaptureSession, String>,
+}
+
+fn spawn_capture_restart(
+    config: CaptureConfig,
+    stream_url: String,
+    delay: Duration,
+    sender: mpsc::Sender<CaptureRestartCompleted>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        sleep(delay).await;
+        let result = CaptureSession::start(config, &stream_url)
+            .await
+            .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(CaptureRestartCompleted { result }).await;
+    })
+}
+
+fn schedule_capture_restart(
+    recovery: &mut CaptureRecoveryState,
+    task: &mut Option<JoinHandle<()>>,
+    config: &CaptureConfig,
+    stream_url: &str,
+    sender: &mpsc::Sender<CaptureRestartCompleted>,
+) -> Option<Duration> {
+    let delay = recovery.schedule()?;
+    *task = Some(spawn_capture_restart(
+        config.clone(),
+        stream_url.to_owned(),
+        delay,
+        sender.clone(),
+    ));
+    Some(delay)
+}
+
+async fn next_capture_event(capture: &mut Option<CaptureSession>) -> Option<CaptureEvent> {
+    match capture.as_mut() {
+        Some(session) => session.next_event().await,
+        None => pending::<Option<CaptureEvent>>().await,
+    }
+}
+
+async fn acknowledge_segment_for_generation(
+    controller: Option<&CaptureController>,
+    current_generation: u32,
+    segment: &MediaSegment,
+) -> Result<()> {
+    if capture_sequence_generation(segment.sequence) != current_generation {
+        return Ok(());
+    }
+    controller
+        .ok_or_else(|| anyhow!("capture is recovering"))?
+        .acknowledge_segment(segment.id.clone())
+        .await
+}
+
+async fn acknowledge_window_for_generation(
+    controller: Option<&CaptureController>,
+    current_generation: u32,
+    window: &MediaWindow,
+) -> Result<()> {
+    if capture_sequence_generation(window.sequence) != current_generation {
+        return Ok(());
+    }
+    controller
+        .ok_or_else(|| anyhow!("capture is recovering"))?
+        .acknowledge_window(window.id.clone())
+        .await
 }
 
 #[derive(Debug)]
@@ -132,6 +300,67 @@ struct ContextCommitCompleted {
     result: std::result::Result<(), String>,
 }
 
+/// Holds only the newest multimodal window that is not already being
+/// analyzed. Broker and rolling-context state remain lossless; obsolete raw
+/// media is deliberately superseded so provider latency cannot grow an
+/// unbounded FIFO behind the livestream edge.
+#[derive(Debug, Default)]
+struct LiveEdgeWindowQueue {
+    pending: Option<MediaWindow>,
+    superseded: u64,
+}
+
+impl LiveEdgeWindowQueue {
+    fn replace(&mut self, incoming: MediaWindow) -> Option<MediaWindow> {
+        let replaced = self.pending.replace(incoming);
+        if replaced.is_some() {
+            self.superseded = self.superseded.saturating_add(1);
+        }
+        replaced
+    }
+
+    fn pending_sequence(&self) -> Option<u64> {
+        self.pending.as_ref().map(|window| window.sequence)
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.pending.is_some())
+    }
+
+    fn superseded(&self) -> u64 {
+        self.superseded
+    }
+
+    fn first_segment_sequence(&self) -> Option<u64> {
+        self.pending
+            .as_ref()
+            .and_then(|window| window.segments.first())
+            .map(|segment| segment.sequence)
+    }
+
+    fn take_ready(&mut self, transcripts: &BTreeMap<u64, TranscriptChunk>) -> Option<MediaWindow> {
+        let ready = self.pending.as_ref().is_some_and(|window| {
+            window.segments.len() == WINDOW_SEGMENTS
+                && window
+                    .segments
+                    .iter()
+                    .all(|segment| transcripts.contains_key(&segment.sequence))
+        });
+        ready.then(|| self.pending.take().expect("ready pending window exists"))
+    }
+}
+
+fn transcript_is_relevant(sequence: u64, first_relevant_sequence: Option<u64>) -> bool {
+    first_relevant_sequence.is_none_or(|floor| sequence >= floor)
+}
+
+fn prune_unreferenced_transcripts(
+    transcripts: &mut BTreeMap<u64, TranscriptChunk>,
+    first_relevant_sequence: Option<u64>,
+) {
+    transcripts.retain(|sequence, _| transcript_is_relevant(*sequence, first_relevant_sequence));
+}
+
 /// A Gemini call remains active until its validated rolling context has been
 /// durably committed. This makes the context supplied to call N+1 exactly the
 /// context returned by call N, while the rest of the runtime remains async.
@@ -173,6 +402,8 @@ enum RuntimeAuditEvent {
         component: String,
         status: String,
         detail: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latency_ms: Option<u64>,
     },
 }
 
@@ -341,7 +572,6 @@ async fn run_internal(
 
     let gemini_config = GeminiClientConfig {
         model: config.gemini.model.clone(),
-        confidence_threshold: config.trading.minimum_confidence_pct.round() as u8,
         ..GeminiClientConfig::default()
     };
     let gemini_client = Arc::new(GeminiClient::from_keys_config(
@@ -491,12 +721,18 @@ async fn run_internal(
         clip_retention: config.media.clips_to_keep,
         ..CaptureConfig::default()
     };
-    let mut capture = CaptureSession::start(capture_config, &stream_url)
+    let initial_capture = CaptureSession::start(capture_config.clone(), &stream_url)
         .await
         .context("could not start current-live-edge capture")?;
-    let capture_controller = capture.controller();
+    let mut capture_controller = Some(initial_capture.controller());
+    let mut capture = Some(initial_capture);
+    let (capture_restart_sender, mut capture_restart_receiver) =
+        mpsc::channel::<CaptureRestartCompleted>(1);
+    let mut capture_restart_task = None::<JoinHandle<()>>;
+    let mut capture_recovery = CaptureRecoveryState::default();
+    let mut capture_generation = 0u32;
     session_view.status = "RUNNING".to_owned();
-    health.stream_capture = component("STARTING", "waiting for the first closed 4-second segment");
+    health.stream_capture = component("STARTING", "waiting for the first closed 5-second segment");
     health.persistence = component(
         "HEALTHY",
         if neon_store.is_some() {
@@ -517,7 +753,7 @@ async fn run_internal(
     let (context_commit_sender, mut context_commit_receiver) =
         mpsc::channel::<ContextCommitCompleted>(1);
     let mut transcripts = BTreeMap::<u64, TranscriptChunk>::new();
-    let mut pending_windows = BTreeMap::<u64, MediaWindow>::new();
+    let mut pending_windows = LiveEdgeWindowQueue::default();
     let mut gemini_dispatch = GeminiDispatchState::default();
     let mut candidate_watches = Vec::<CandidateWatch>::new();
     let mut persistent_leases = HashMap::<(String, SubscriptionReason), SubscriptionLease>::new();
@@ -620,37 +856,161 @@ async fn run_internal(
                 }
                 dashboard_dirty = true;
             }
-            capture_event = capture.next_event(), if capture_active => {
+            capture_event = next_capture_event(&mut capture), if capture_active => {
                 match capture_event {
-                    Some(CaptureEvent::SegmentReady(segment)) => {
-                        health.stream_capture = component("HEALTHY", "receiving exact 4-second live-edge segments");
+                    Some(CaptureEvent::SegmentReady(mut segment)) => {
+                        if let Err(error) = qualify_segment(capture_generation, &mut segment) {
+                            capture_active = false;
+                            capture_controller = None;
+                            capture.take();
+                            let delay = schedule_capture_restart(
+                                &mut capture_recovery,
+                                &mut capture_restart_task,
+                                &capture_config,
+                                &stream_url,
+                                &capture_restart_sender,
+                            ).unwrap_or(CAPTURE_RESTART_MAX_DELAY);
+                            health.stream_capture = component(
+                                "RECOVERING",
+                                format!("capture restart scheduled in {}s; market management remains active", delay.as_secs()),
+                            );
+                            session_view.status = "CAPTURE_RECOVERING_MARKET_MANAGEMENT_ACTIVE".to_owned();
+                            runtime_logger
+                                .record("ERROR", "capture", "SEQUENCE_QUALIFICATION_FAILED", &error.to_string())
+                                .await;
+                            dashboard_dirty = true;
+                            continue;
+                        }
+                        health.stream_capture = component("HEALTHY", "receiving exact 5-second live-edge segments");
                         session_view.transcript_segments_ready = transcripts.len();
                         spawn_stt_job(stt_client.clone(), stt_sender.clone(), segment);
                     }
-                    Some(CaptureEvent::WindowReady(window)) => {
+                    Some(CaptureEvent::WindowReady(mut window)) => {
+                        if let Err(error) = qualify_window(capture_generation, &mut window) {
+                            capture_active = false;
+                            capture_controller = None;
+                            capture.take();
+                            let delay = schedule_capture_restart(
+                                &mut capture_recovery,
+                                &mut capture_restart_task,
+                                &capture_config,
+                                &stream_url,
+                                &capture_restart_sender,
+                            ).unwrap_or(CAPTURE_RESTART_MAX_DELAY);
+                            health.stream_capture = component(
+                                "RECOVERING",
+                                format!("capture restart scheduled in {}s; market management remains active", delay.as_secs()),
+                            );
+                            session_view.status = "CAPTURE_RECOVERING_MARKET_MANAGEMENT_ACTIVE".to_owned();
+                            runtime_logger
+                                .record("ERROR", "capture", "SEQUENCE_QUALIFICATION_FAILED", &error.to_string())
+                                .await;
+                            dashboard_dirty = true;
+                            continue;
+                        }
                         session_view.clip_window_start = Some(window.started_at_utc.to_rfc3339());
                         session_view.clip_window_end = Some(window.ended_at_utc.to_rfc3339());
                         session_view.clip_age_ms = Some(age_ms(window.ended_at_utc, Utc::now()));
-                        pending_windows.insert(window.sequence, window);
+                        if let Some(superseded) = pending_windows.replace(window) {
+                            if let Err(error) = acknowledge_window_for_generation(
+                                capture_controller.as_ref(),
+                                capture_generation,
+                                &superseded,
+                            ).await
+                            {
+                                health.stream_capture = component(
+                                    "DEGRADED",
+                                    "superseded clip cleanup acknowledgement failed; capture liveness is still monitored by events",
+                                );
+                                runtime_logger
+                                    .record(
+                                        "WARN",
+                                        "capture",
+                                        "SUPERSEDED_WINDOW_ACK_FAILED",
+                                        &format!(
+                                            "could not acknowledge superseded window {}: {error:#}",
+                                            superseded.sequence
+                                        ),
+                                    )
+                                    .await;
+                            } else {
+                                append_pipeline_audit(
+                                    &mut audit_writer,
+                                    "gemini",
+                                    "window_superseded",
+                                    &format!(
+                                        "dropped pending window {} to stay at the live edge",
+                                        superseded.sequence
+                                    ),
+                                )?;
+                            }
+                        }
+                        prune_unreferenced_transcripts(
+                            &mut transcripts,
+                            pending_windows.first_segment_sequence(),
+                        );
                         dashboard_dirty = true;
                     }
-                    Some(CaptureEvent::Fault { message, .. }) => {
-                        health.stream_capture = component("DEGRADED", message.clone());
+                    Some(CaptureEvent::Fault { fatal, message, .. }) => {
                         append_pipeline_audit(&mut audit_writer, "capture", "fault", &message)?;
-                        runtime_logger
-                            .record(
-                                "ERROR",
-                                "capture",
-                                "CAPTURE_FAULT",
-                                "live-edge capture reported a recoverable fault",
-                            )
-                            .await;
+                        if fatal {
+                            capture_active = false;
+                            capture_controller = None;
+                            capture.take();
+                            let delay = schedule_capture_restart(
+                                &mut capture_recovery,
+                                &mut capture_restart_task,
+                                &capture_config,
+                                &stream_url,
+                                &capture_restart_sender,
+                            ).unwrap_or(CAPTURE_RESTART_MAX_DELAY);
+                            health.stream_capture = component(
+                                "RECOVERING",
+                                format!("capture restart scheduled in {}s; market management remains active", delay.as_secs()),
+                            );
+                            session_view.status = "CAPTURE_RECOVERING_MARKET_MANAGEMENT_ACTIVE".to_owned();
+                            runtime_logger
+                                .record(
+                                    "ERROR",
+                                    "capture",
+                                    "CAPTURE_RESTART_SCHEDULED",
+                                    &format!("fatal capture failure; retry scheduled in {}s: {message}", delay.as_secs()),
+                                )
+                                .await;
+                        } else {
+                            health.stream_capture = component("DEGRADED", "live-edge analysis window skipped; ingest continues");
+                            runtime_logger
+                                .record(
+                                    "WARN",
+                                    "capture",
+                                    "CAPTURE_WINDOW_SKIPPED",
+                                    &message,
+                                )
+                                .await;
+                        }
                         dashboard_dirty = true;
                     }
                     Some(CaptureEvent::Stopped { reason, .. }) => {
                         capture_active = false;
-                        health.stream_capture = component("STOPPED", format!("stream capture stopped: {reason:?}"));
-                        session_view.status = "STREAM_ENDED_MARKET_MANAGEMENT_ACTIVE".to_owned();
+                        capture_controller = None;
+                        capture.take();
+                        if capture_stop_should_restart(reason) {
+                            let delay = schedule_capture_restart(
+                                &mut capture_recovery,
+                                &mut capture_restart_task,
+                                &capture_config,
+                                &stream_url,
+                                &capture_restart_sender,
+                            ).unwrap_or(CAPTURE_RESTART_MAX_DELAY);
+                            health.stream_capture = component(
+                                "RECOVERING",
+                                format!("capture restart scheduled in {}s; market management remains active", delay.as_secs()),
+                            );
+                            session_view.status = "CAPTURE_RECOVERING_MARKET_MANAGEMENT_ACTIVE".to_owned();
+                        } else {
+                            health.stream_capture = component("STOPPED", format!("stream capture stopped: {reason:?}"));
+                            session_view.status = "STREAM_ENDED_MARKET_MANAGEMENT_ACTIVE".to_owned();
+                        }
                         append_pipeline_audit(&mut audit_writer, "capture", "stopped", &format!("{reason:?}"))?;
                         runtime_logger
                             .record(
@@ -664,13 +1024,26 @@ async fn run_internal(
                     }
                     None => {
                         capture_active = false;
-                        health.stream_capture = component("STOPPED", "capture event channel closed");
+                        capture_controller = None;
+                        capture.take();
+                        let delay = schedule_capture_restart(
+                            &mut capture_recovery,
+                            &mut capture_restart_task,
+                            &capture_config,
+                            &stream_url,
+                            &capture_restart_sender,
+                        ).unwrap_or(CAPTURE_RESTART_MAX_DELAY);
+                        health.stream_capture = component(
+                            "RECOVERING",
+                            format!("capture event channel closed; retry scheduled in {}s", delay.as_secs()),
+                        );
+                        session_view.status = "CAPTURE_RECOVERING_MARKET_MANAGEMENT_ACTIVE".to_owned();
                         runtime_logger
                             .record(
                                 "WARN",
                                 "capture",
                                 "CAPTURE_CHANNEL_CLOSED",
-                                "capture event channel closed",
+                                &format!("capture event channel closed; retry scheduled in {}s", delay.as_secs()),
                             )
                             .await;
                         dashboard_dirty = true;
@@ -690,6 +1063,72 @@ async fn run_internal(
                     rolling_context.as_ref(),
                     &mut gemini_dispatch,
                 );
+            }
+            Some(completed) = capture_restart_receiver.recv(), if capture_recovery.is_pending() => {
+                capture_restart_task.take();
+                match completed.result {
+                    Ok(session) => {
+                        capture_recovery.finish(true);
+                        capture_generation = capture_generation
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("capture generation counter exhausted"))?;
+                        capture_controller = Some(session.controller());
+                        capture = Some(session);
+                        capture_active = true;
+                        health.stream_capture = component(
+                            "STARTING",
+                            format!(
+                                "capture restarted {} time(s); waiting for the first live-edge segment",
+                                capture_recovery.restart_count()
+                            ),
+                        );
+                        session_view.status = "RUNNING".to_owned();
+                        append_pipeline_audit(
+                            &mut audit_writer,
+                            "capture",
+                            "restarted",
+                            &format!("capture generation {capture_generation} started at the current edge"),
+                        )?;
+                        runtime_logger
+                            .record(
+                                "INFO",
+                                "capture",
+                                "CAPTURE_RESTARTED",
+                                &format!("capture generation {capture_generation} started at the current edge"),
+                            )
+                            .await;
+                    }
+                    Err(error) => {
+                        capture_recovery.finish(false);
+                        let delay = schedule_capture_restart(
+                            &mut capture_recovery,
+                            &mut capture_restart_task,
+                            &capture_config,
+                            &stream_url,
+                            &capture_restart_sender,
+                        ).expect("a completed restart releases the single-flight guard");
+                        health.stream_capture = component(
+                            "RECOVERING",
+                            format!("capture restart retry in {}s; market management remains active", delay.as_secs()),
+                        );
+                        session_view.status = "CAPTURE_RECOVERING_MARKET_MANAGEMENT_ACTIVE".to_owned();
+                        append_pipeline_audit(
+                            &mut audit_writer,
+                            "capture",
+                            "restart_failed",
+                            &format!("retry scheduled in {}s", delay.as_secs()),
+                        )?;
+                        runtime_logger
+                            .record(
+                                "ERROR",
+                                "capture",
+                                "CAPTURE_RESTART_FAILED",
+                                &format!("retry scheduled in {}s: {error}", delay.as_secs()),
+                            )
+                            .await;
+                    }
+                }
+                dashboard_dirty = true;
             }
             Some(completed) = stt_receiver.recv() => {
                 let complete = completed.transcript.status == TranscriptStatus::Complete;
@@ -712,16 +1151,20 @@ async fn run_internal(
                         )
                         .await;
                 }
-                transcripts.insert(completed.segment.sequence, completed.transcript);
-                if let Err(error) = capture_controller
-                    .acknowledge_segment(completed.segment.id)
-                    .await
+                if transcript_is_relevant(
+                    completed.segment.sequence,
+                    pending_windows.first_segment_sequence(),
+                ) {
+                    transcripts.insert(completed.segment.sequence, completed.transcript);
+                }
+                if let Err(_error) = acknowledge_segment_for_generation(
+                    capture_controller.as_ref(),
+                    capture_generation,
+                    &completed.segment,
+                ).await
                 {
-                    capture_active = false;
-                    health.stream_capture = component(
-                        "STOPPED",
-                        format!("capture stopped before segment acknowledgement: {error:#}"),
-                    );
+                    (capture_active, health.stream_capture) =
+                        capture_acknowledgement_failure(capture_active, "segment");
                     append_pipeline_audit(
                         &mut audit_writer,
                         "capture",
@@ -755,15 +1198,14 @@ async fn run_internal(
                 dashboard_dirty = true;
             }
             Some(completed) = gemini_receiver.recv() => {
-                if let Err(error) = capture_controller
-                    .acknowledge_window(completed.window.id.clone())
-                    .await
+                if let Err(_error) = acknowledge_window_for_generation(
+                    capture_controller.as_ref(),
+                    capture_generation,
+                    &completed.window,
+                ).await
                 {
-                    capture_active = false;
-                    health.stream_capture = component(
-                        "STOPPED",
-                        format!("capture stopped before window acknowledgement: {error:#}"),
-                    );
+                    (capture_active, health.stream_capture) =
+                        capture_acknowledgement_failure(capture_active, "window");
                     append_pipeline_audit(
                         &mut audit_writer,
                         "capture",
@@ -827,7 +1269,13 @@ async fn run_internal(
                         }
                         Err(error) => {
                             health.gemini = component("DEGRADED", error.clone());
-                            append_pipeline_audit(&mut audit_writer, "gemini", "error", &error)?;
+                            append_pipeline_audit_with_latency(
+                                &mut audit_writer,
+                                "gemini",
+                                "error",
+                                &error,
+                                completed.latency_ms,
+                            )?;
                             runtime_logger
                                 .record("ERROR", "gemini", "ANALYSIS_FAILED", &error)
                                 .await;
@@ -888,6 +1336,13 @@ async fn run_internal(
                                 "strict multimodal analysis and context commit complete",
                                 committed.completed.latency_ms,
                             );
+                            append_pipeline_audit_with_latency(
+                                &mut audit_writer,
+                                "gemini",
+                                "complete",
+                                "strict multimodal analysis and context commit complete",
+                                committed.completed.latency_ms,
+                            )?;
                             // A candidate is consumed only after its observed
                             // LTP reached a validated, durably committed call.
                             // Failed API/validation/commit attempts keep the
@@ -1006,11 +1461,12 @@ async fn run_internal(
                                 "DEGRADED",
                                 "discarded analysis because its context envelope no longer matches the active stream day",
                             );
-                            append_pipeline_audit(
+                            append_pipeline_audit_with_latency(
                                 &mut audit_writer,
                                 "stream_context",
                                 "scope_mismatch",
                                 &format!("window {sequence} completed outside its stream/date scope"),
+                                committed.completed.latency_ms,
                             )?;
                             runtime_logger
                                 .record(
@@ -1317,7 +1773,13 @@ async fn run_internal(
     audit_writer.finish()?;
     drop(candidate_watches);
     drop(persistent_leases);
-    let _ = capture.shutdown().await;
+    if let Some(task) = capture_restart_task.take() {
+        task.abort();
+    }
+    capture_recovery.cancel();
+    if let Some(capture) = capture {
+        let _ = capture.shutdown().await;
+    }
     let _ = feed_runtime.shutdown().await;
     if let Some(task) = dashboard_task {
         task.abort();
@@ -1394,7 +1856,8 @@ fn spawn_stt_job(
 ) {
     tokio::spawn(async move {
         let started = Instant::now();
-        let start_sec = segment.sequence as f64 * SEGMENT_SECONDS as f64;
+        let local_sequence = capture_local_sequence(segment.sequence);
+        let start_sec = local_sequence as f64 * SEGMENT_SECONDS as f64;
         let input = SegmentInput::new(
             segment.sequence,
             start_sec,
@@ -1413,7 +1876,7 @@ fn spawn_stt_job(
 
 #[allow(clippy::too_many_arguments)]
 fn launch_next_ready_window(
-    pending: &mut BTreeMap<u64, MediaWindow>,
+    pending: &mut LiveEdgeWindowQueue,
     transcripts: &mut BTreeMap<u64, TranscriptChunk>,
     candidates: &mut Vec<CandidateWatch>,
     known_routes: &HashMap<String, RoutedContract>,
@@ -1430,26 +1893,15 @@ fn launch_next_ready_window(
         return;
     }
 
-    // Do not skip an older window whose STT is still finishing. Strict FIFO is
-    // what makes every response the context source for exactly the next call.
-    let Some((&sequence, oldest)) = pending.first_key_value() else {
+    let Some(window) = pending.take_ready(transcripts) else {
         return;
     };
-    if oldest.segments.len() != WINDOW_SEGMENTS
-        || !oldest
-            .segments
-            .iter()
-            .all(|segment| transcripts.contains_key(&segment.sequence))
-    {
-        return;
-    }
+    let sequence = window.sequence;
     if !dispatch.try_begin(sequence) {
+        let _ = pending.replace(window);
         return;
     }
 
-    let window = pending
-        .remove(&sequence)
-        .expect("the oldest pending Gemini window was just observed");
     let chunks = window
         .segments
         .iter()
@@ -1493,7 +1945,7 @@ fn launch_next_ready_window(
     health.gemini = component(
         "PROCESSING",
         format!(
-            "analyzing synchronized 8-second window {sequence} ({} queued)",
+            "analyzing synchronized {WINDOW_SECONDS}-second window {sequence} ({} queued)",
             pending.len()
         ),
     );
@@ -1505,7 +1957,9 @@ fn launch_next_ready_window(
                 .await
                 .map_err(|error| format!("{error:#}"))
         } else {
-            Err("8-second clip exceeds the safe inline upload limit".to_owned())
+            Err(format!(
+                "{WINDOW_SECONDS}-second clip exceeds the safe inline upload limit"
+            ))
         };
         let completed = GeminiCompleted {
             window,
@@ -1682,7 +2136,155 @@ fn build_analysis_input(
         transcripts,
         watched_options,
         open_trades: open_trade_snapshots(&broker_snapshot, known_routes, latest),
+        bot_state: bot_state_from_snapshot(&broker_snapshot),
         rolling_context: rolling_context.cloned(),
+    }
+}
+
+fn bot_state_from_snapshot(snapshot: &PaperBrokerSnapshot) -> BotStateSnapshot {
+    let Some(llm_shadow) = snapshot
+        .shadows
+        .iter()
+        .find(|shadow| shadow.mode == ShadowMode::LlmExit)
+    else {
+        return BotStateSnapshot::default();
+    };
+
+    let mut pending_entries = BTreeMap::<String, (usize, i64)>::new();
+    let mut open_positions = BTreeMap::<String, (usize, i64)>::new();
+    let mut pending_exits = BTreeMap::<String, (usize, i64)>::new();
+    for account in &llm_shadow.accounts {
+        for order in &account.pending_entries {
+            let aggregate = pending_entries
+                .entry(order.setup_id.clone())
+                .or_insert((0, order.created_timestamp_ms));
+            aggregate.0 += 1;
+            aggregate.1 = aggregate.1.min(order.created_timestamp_ms);
+        }
+        for position in &account.open_positions {
+            let position = &position.position;
+            let aggregate = open_positions
+                .entry(position.setup_id.clone())
+                .or_insert((0, position.opened_timestamp_ms));
+            aggregate.0 += 1;
+            aggregate.1 = aggregate.1.min(position.opened_timestamp_ms);
+            if let Some(exit) = &position.llm_exit_request {
+                let aggregate = pending_exits
+                    .entry(position.setup_id.clone())
+                    .or_insert((0, exit.requested_timestamp_ms));
+                aggregate.0 += 1;
+                aggregate.1 = aggregate.1.min(exit.requested_timestamp_ms);
+            }
+        }
+    }
+
+    let mut state = BotStateSnapshot::default();
+    for (setup_id, (pending_count, pending_since)) in &pending_entries {
+        if open_positions.contains_key(setup_id) {
+            continue;
+        }
+        state.pending.push(paper_lifecycle_outcome(
+            setup_id,
+            ActionKind::PlaceEntry,
+            BotActionStatus::Pending,
+            format!("{pending_count} paper wallet entry order(s) pending"),
+            *pending_since,
+            "entry",
+        ));
+    }
+    for (setup_id, (open_count, opened_at)) in &open_positions {
+        let pending_count = pending_entries
+            .get(setup_id)
+            .map(|(count, _)| *count)
+            .unwrap_or_default();
+        let status = if pending_count > 0 {
+            BotActionStatus::PartiallyFilled
+        } else {
+            BotActionStatus::Filled
+        };
+        state.open.push(paper_lifecycle_outcome(
+            setup_id,
+            ActionKind::PlaceEntry,
+            status,
+            format!(
+                "{open_count} paper wallet position(s) open; {pending_count} entry order(s) pending"
+            ),
+            *opened_at,
+            "entry",
+        ));
+    }
+    for (setup_id, (count, requested_at)) in pending_exits {
+        state.pending.push(paper_lifecycle_outcome(
+            &setup_id,
+            ActionKind::Exit,
+            BotActionStatus::Pending,
+            format!("LLM exit queued for {count} paper wallet position(s)"),
+            requested_at,
+            "exit",
+        ));
+    }
+
+    let active_setups = pending_entries
+        .keys()
+        .chain(open_positions.keys())
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut latest_closed = BTreeMap::<String, (usize, i64)>::new();
+    for trade in snapshot
+        .closed_trade_history
+        .iter()
+        .filter(|trade| trade.mode == ShadowMode::LlmExit)
+        .filter(|trade| !active_setups.contains(&trade.setup_id))
+    {
+        let aggregate = latest_closed
+            .entry(trade.setup_id.clone())
+            .or_insert((0, trade.closed_timestamp_ms));
+        aggregate.0 += 1;
+        aggregate.1 = aggregate.1.max(trade.closed_timestamp_ms);
+    }
+    let mut terminal = latest_closed
+        .into_iter()
+        .map(|(setup_id, (count, closed_at))| {
+            (
+                closed_at,
+                paper_lifecycle_outcome(
+                    &setup_id,
+                    ActionKind::Exit,
+                    BotActionStatus::Exited,
+                    format!("{count} paper wallet position(s) closed"),
+                    closed_at,
+                    "entry",
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    terminal.sort_by_key(|(closed_at, _)| *closed_at);
+    state.recent_terminal = terminal
+        .into_iter()
+        .rev()
+        .take(16)
+        .map(|(_, outcome)| outcome)
+        .collect::<Vec<_>>();
+    state.recent_terminal.reverse();
+    state
+}
+
+fn paper_lifecycle_outcome(
+    setup_id: &str,
+    action: ActionKind,
+    status: BotActionStatus,
+    detail: String,
+    occurred_at_ms: i64,
+    event_kind: &str,
+) -> BotActionOutcome {
+    BotActionOutcome {
+        event_id: format!("paper:{setup_id}:{event_kind}"),
+        episode_id: None,
+        trade_id: Some(setup_id.to_owned()),
+        action,
+        status,
+        detail,
+        occurred_at: timestamp_from_ms(occurred_at_ms).to_rfc3339(),
     }
 }
 
@@ -1766,6 +2368,15 @@ async fn apply_analysis(
     let freshness = format!("{:?}", analysis.freshness.status).to_ascii_uppercase();
 
     for rejected in analysis.rejected_actions {
+        let decision = format!("Rust semantic rejection: {}", rejected.reason);
+        reconcile_runtime_action_outcome(
+            rolling_context,
+            &rejected.action,
+            false,
+            "",
+            &decision,
+            received_at,
+        );
         push_signal(
             signals,
             signal_view(
@@ -1775,7 +2386,7 @@ async fn apply_analysis(
                 String::new(),
                 &bias,
                 &freshness,
-                format!("Rust semantic rejection: {}", rejected.reason),
+                decision,
                 None,
             ),
         );
@@ -1784,6 +2395,15 @@ async fn apply_analysis(
     for action in analysis.actions {
         if let Some(reason) = executable_action_freshness_issue(&action, completed, received_at) {
             reconcile_entry_application(rolling_context, &action, false);
+            let decision = format!("Runtime action rejection: {reason}");
+            reconcile_runtime_action_outcome(
+                rolling_context,
+                &action,
+                false,
+                "",
+                &decision,
+                received_at,
+            );
             push_signal(
                 signals,
                 signal_view(
@@ -1793,7 +2413,7 @@ async fn apply_analysis(
                     String::new(),
                     &bias,
                     &freshness,
-                    format!("Runtime action rejection: {reason}"),
+                    decision,
                     None,
                 ),
             );
@@ -1937,11 +2557,8 @@ async fn apply_analysis(
                                 setup_id = find_setup_for_contract(broker, &route.paper)
                                     .unwrap_or_default();
                             }
-                            let events = broker.request_llm_exit(
-                                &setup_id,
-                                action.confidence_pct,
-                                received_at.timestamp_millis(),
-                            );
+                            let events =
+                                broker.request_llm_exit(&setup_id, received_at.timestamp_millis());
                             accepted = events
                                 .iter()
                                 .any(|event| event.event_type == paper::EventType::LlmExitQueued);
@@ -1970,14 +2587,22 @@ async fn apply_analysis(
                 &action,
                 completed,
                 accepted,
-                setup_id,
+                setup_id.clone(),
                 &bias,
                 &freshness,
-                decision,
+                decision.clone(),
                 route_for_signal.as_ref(),
             ),
         );
         reconcile_entry_application(rolling_context, &action, accepted);
+        reconcile_runtime_action_outcome(
+            rolling_context,
+            &action,
+            accepted,
+            &setup_id,
+            &decision,
+            received_at,
+        );
     }
 }
 
@@ -2022,6 +2647,50 @@ fn reconcile_entry_application(
             episode.status = gemini::TradeEpisodeStatus::ConditionalEntry;
         }
     }
+}
+
+fn reconcile_runtime_action_outcome(
+    context: &mut gemini::RollingContext,
+    action: &TradeAction,
+    accepted: bool,
+    setup_id: &str,
+    detail: &str,
+    occurred_at: DateTime<Utc>,
+) {
+    let status = if matches!(action.action, ActionKind::Hold | ActionKind::Ignore) {
+        BotActionStatus::Skipped
+    } else if !accepted {
+        BotActionStatus::Rejected
+    } else {
+        match action.action {
+            ActionKind::PlaceEntry | ActionKind::Exit => BotActionStatus::Pending,
+            ActionKind::CancelEntry => BotActionStatus::Cancelled,
+            ActionKind::Watch | ActionKind::UpdateLevels => BotActionStatus::Accepted,
+            ActionKind::Hold | ActionKind::Ignore => unreachable!(),
+        }
+    };
+    let event_id = action.event_id.clone().unwrap_or_else(|| {
+        format!(
+            "runtime:{}:{}",
+            occurred_at.timestamp_millis(),
+            format!("{:?}", action.action).to_ascii_lowercase()
+        )
+    });
+    let trade_id = (!setup_id.trim().is_empty())
+        .then(|| setup_id.trim().to_owned())
+        .or_else(|| action.trade_id.clone());
+    // Every field is constructed locally and non-empty where required. If a
+    // future schema bound rejects it, fail closed by retaining the previously
+    // committed context rather than trusting a model-authored outcome.
+    let _ = context.reconcile_bot_action_outcome(BotActionOutcome {
+        event_id,
+        episode_id: action.episode_id.clone(),
+        trade_id,
+        action: action.action,
+        status,
+        detail: detail.to_owned(),
+        occurred_at: occurred_at.to_rfc3339(),
+    });
 }
 
 fn executable_action_freshness_issue(
@@ -2090,7 +2759,6 @@ fn action_to_setup(
         contract: route.paper.clone(),
         side: TradeSide::Buy,
         levels,
-        confidence_pct: action.confidence_pct,
         evidence_timestamp_ms,
         received_timestamp_ms: received_at.timestamp_millis(),
     })
@@ -2196,7 +2864,7 @@ fn resolve_route(
 
 fn parse_expiry(value: &str) -> Result<NaiveDate> {
     let normalized = value.trim().to_ascii_uppercase();
-    ["%Y-%m-%d", "%d %b %Y", "%d-%m-%Y", "%d/%m/%Y"]
+    ["%Y-%m-%d", "%d %b %y", "%d %b %Y", "%d-%m-%Y", "%d/%m/%Y"]
         .into_iter()
         .find_map(|format| NaiveDate::parse_from_str(&normalized, format).ok())
         .ok_or_else(|| anyhow!("unsupported expiry format"))
@@ -2417,6 +3085,23 @@ fn append_pipeline_audit(
         component: component_name.to_owned(),
         status: status.to_owned(),
         detail: detail.to_owned(),
+        latency_ms: None,
+    })
+}
+
+fn append_pipeline_audit_with_latency(
+    writer: &mut JsonlEventWriter,
+    component_name: &str,
+    status: &str,
+    detail: &str,
+    latency_ms: u64,
+) -> Result<()> {
+    writer.append(&RuntimeAuditEvent::Pipeline {
+        timestamp: Utc::now().to_rfc3339(),
+        component: component_name.to_owned(),
+        status: status.to_owned(),
+        detail: detail.to_owned(),
+        latency_ms: Some(latency_ms),
     })
 }
 
@@ -2465,7 +3150,6 @@ fn stream_context_envelope_matches(
         && envelope.stream_url == stream_url
         && envelope.trading_date_ist == trading_date_ist
         && ist_trading_date(envelope.source_clip_ended_at) == trading_date_ist
-        && envelope.updated_at >= envelope.source_clip_ended_at
 }
 
 fn signal_view(
@@ -2506,7 +3190,23 @@ fn signal_view(
             "{}-{}-{}",
             completed.window.id,
             format!("{:?}", action.action).to_ascii_lowercase(),
-            action.confidence_pct
+            action
+                .event_id
+                .as_deref()
+                .or(action.trade_id.as_deref())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    action
+                        .evidence_timestamps
+                        .first()
+                        .map(|evidence| {
+                            format!(
+                                "evidence-{}",
+                                (evidence.seconds_from_clip_start * 1_000.0) as u64
+                            )
+                        })
+                        .unwrap_or_else(|| "observation".to_owned())
+                })
         ),
         setup_id,
         received_at: Utc::now().to_rfc3339(),
@@ -2530,7 +3230,6 @@ fn signal_view(
         stop_loss: levels.and_then(|levels| levels.hard_sl),
         target_1: levels.and_then(|levels| levels.t1),
         target_2: levels.and_then(|levels| levels.t2),
-        confidence_pct: f64::from(action.confidence_pct),
         market_bias: bias.to_owned(),
         source_age_ms: Some(completed.input.clip.data_age_ms),
         freshness: freshness.to_owned(),
@@ -2670,9 +3369,6 @@ fn merge_closed_history(
             charges: paise_to_rupees(trade.entry_charge_paise + trade.exit_charge_paise),
             net_pnl: paise_to_rupees(trade.net_pnl_paise),
             return_pct,
-            confidence_pct: setup
-                .map(|setup| f64::from(setup.confidence_pct))
-                .unwrap_or_default(),
             max_favorable_price: paise_to_rupees(trade.maximum_ltp_paise),
             max_adverse_price: paise_to_rupees(trade.minimum_ltp_paise),
             notes: format!("paper-only {:?} exit", trade.exit_reason),
@@ -2692,7 +3388,6 @@ fn paper_broker_config(config: &AppConfig) -> Result<PaperBrokerConfig> {
         entry_buffer_paise: points_to_paise(config.trading.entry_buffer_points)?,
         entry_charge_paise: points_to_paise(config.trading.charge_per_fill_rupees)?,
         exit_charge_paise: points_to_paise(config.trading.charge_per_fill_rupees)?,
-        minimum_confidence_pct: config.trading.minimum_confidence_pct.round() as u8,
         pending_entry_ttl_ms: paper::DEFAULT_PENDING_ENTRY_TTL_MS,
         ..PaperBrokerConfig::default()
     })
@@ -2771,11 +3466,6 @@ fn dashboard_state(
     history: Vec<HistoryTrade>,
     exit_charge_rupees: f64,
 ) -> DashboardState {
-    let setups = snapshot
-        .accepted_setups
-        .iter()
-        .map(|setup| (setup.setup_id.clone(), setup))
-        .collect::<HashMap<_, _>>();
     let ticks = snapshot
         .latest_ticks
         .iter()
@@ -2877,7 +3567,6 @@ fn dashboard_state(
 
             for order in &account.pending_entries {
                 let tick = ticks.get(&order.contract.instrument_id).copied();
-                let setup = setups.get(&order.setup_id).copied();
                 pending_orders.push(PendingOrderView {
                     order_id: order.order_id.clone(),
                     setup_id: order.setup_id.clone(),
@@ -2899,9 +3588,6 @@ fn dashboard_state(
                     ),
                     current_ltp: tick.map(|tick| paise_to_rupees(tick.ltp_paise)),
                     reserved_cash: paise_to_rupees(order.reserved_paise),
-                    confidence_pct: setup
-                        .map(|setup| f64::from(setup.confidence_pct))
-                        .unwrap_or_default(),
                     status: "WAITING_FOR_FRESH_MATCH".to_owned(),
                     created_at: timestamp_from_ms(order.created_timestamp_ms).to_rfc3339(),
                     expires_at: None,
@@ -3065,6 +3751,21 @@ fn component(status: impl Into<String>, message: impl Into<String>) -> Component
     }
 }
 
+fn capture_acknowledgement_failure(
+    capture_active: bool,
+    resource: &str,
+) -> (bool, ComponentHealth) {
+    (
+        capture_active,
+        component(
+            "DEGRADED",
+            format!(
+                "{resource} cleanup acknowledgement failed; capture liveness is still determined by live events"
+            ),
+        ),
+    )
+}
+
 fn healthy_with_latency(message: impl Into<String>, latency_ms: u64) -> ComponentHealth {
     ComponentHealth {
         status: "HEALTHY".to_owned(),
@@ -3100,7 +3801,10 @@ fn overall_health(health: &HealthView) -> String {
         .any(|status| matches!(status.as_str(), "STOPPED" | "ERROR" | "FAILED"))
     {
         "DEGRADED".to_owned()
-    } else if statuses.iter().any(|status| status.as_str() == "DEGRADED") {
+    } else if statuses
+        .iter()
+        .any(|status| matches!(status.as_str(), "DEGRADED" | "RECOVERING"))
+    {
         "DEGRADED".to_owned()
     } else if statuses
         .iter()
@@ -3193,11 +3897,228 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
 mod tests {
     use super::*;
 
+    fn live_edge_test_segment(sequence: u64) -> MediaSegment {
+        let base = Utc.with_ymd_and_hms(2026, 8, 13, 4, 0, 0).single().unwrap();
+        let started_at_utc =
+            base + chrono::Duration::seconds(sequence as i64 * SEGMENT_SECONDS as i64);
+        MediaSegment {
+            id: format!("segment-{sequence}"),
+            sequence,
+            path: std::path::PathBuf::from(format!("segment-{sequence}.ts")),
+            started_at_utc,
+            ended_at_utc: started_at_utc + chrono::Duration::seconds(4),
+            duration_ms: 4_000,
+            size_bytes: 1,
+        }
+    }
+
+    fn live_edge_test_window(sequence: u64) -> MediaWindow {
+        let first_segment_sequence = sequence * WINDOW_SEGMENTS as u64;
+        let segments = (0..WINDOW_SEGMENTS as u64)
+            .map(|offset| live_edge_test_segment(first_segment_sequence + offset))
+            .collect::<Vec<_>>();
+        MediaWindow {
+            id: format!("window-{sequence}"),
+            sequence,
+            path: std::path::PathBuf::from(format!("window-{sequence}.mp4")),
+            started_at_utc: segments.first().unwrap().started_at_utc,
+            ended_at_utc: segments.last().unwrap().ended_at_utc,
+            created_at_utc: segments.last().unwrap().ended_at_utc,
+            duration_ms: WINDOW_SECONDS * 1_000,
+            size_bytes: 1,
+            inline_upload_safe: true,
+            segments,
+        }
+    }
+
+    fn live_edge_test_transcript(sequence: u64) -> TranscriptChunk {
+        TranscriptChunk {
+            index: sequence,
+            start_sec: sequence as f64 * SEGMENT_SECONDS as f64,
+            end_sec: (sequence + 1) as f64 * SEGMENT_SECONDS as f64,
+            status: TranscriptStatus::Complete,
+            text: format!("transcript {sequence}"),
+            failure: None,
+            word_timestamps: Vec::new(),
+            speakers: Vec::new(),
+            language_code: Some("en".to_owned()),
+        }
+    }
+
+    #[test]
+    fn live_edge_queue_keeps_only_the_newest_pending_window() {
+        let mut queue = LiveEdgeWindowQueue::default();
+
+        assert!(queue.replace(live_edge_test_window(10)).is_none());
+        assert_eq!(
+            queue
+                .replace(live_edge_test_window(11))
+                .expect("window 10 should be superseded")
+                .sequence,
+            10
+        );
+        assert_eq!(
+            queue
+                .replace(live_edge_test_window(12))
+                .expect("window 11 should be superseded")
+                .sequence,
+            11
+        );
+        assert_eq!(queue.pending_sequence(), Some(12));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.superseded(), 2);
+    }
+
+    #[test]
+    fn live_edge_queue_launches_newest_when_its_transcripts_are_ready() {
+        let mut queue = LiveEdgeWindowQueue::default();
+        let obsolete = live_edge_test_window(10);
+        let newest = live_edge_test_window(11);
+        let obsolete_sequences = obsolete
+            .segments
+            .iter()
+            .map(|segment| segment.sequence)
+            .collect::<Vec<_>>();
+        let newest_sequences = newest
+            .segments
+            .iter()
+            .map(|segment| segment.sequence)
+            .collect::<Vec<_>>();
+
+        queue.replace(obsolete);
+        queue.replace(newest);
+        let mut transcripts = BTreeMap::new();
+        transcripts.insert(
+            obsolete_sequences[0],
+            live_edge_test_transcript(obsolete_sequences[0]),
+        );
+        assert!(queue.take_ready(&transcripts).is_none());
+        for sequence in newest_sequences {
+            transcripts.insert(sequence, live_edge_test_transcript(sequence));
+        }
+
+        assert_eq!(
+            queue
+                .take_ready(&transcripts)
+                .expect("newest window should become ready")
+                .sequence,
+            11
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn live_edge_transcript_pruning_keeps_only_the_pending_window_range() {
+        let mut transcripts = (18..=26)
+            .map(|sequence| (sequence, live_edge_test_transcript(sequence)))
+            .collect::<BTreeMap<_, _>>();
+
+        prune_unreferenced_transcripts(&mut transcripts, Some(24));
+
+        assert_eq!(
+            transcripts.keys().copied().collect::<Vec<_>>(),
+            vec![24, 25, 26]
+        );
+    }
+
+    #[test]
+    fn live_edge_transcript_rejects_a_late_obsolete_completion() {
+        assert!(!transcript_is_relevant(20, Some(24)));
+        assert!(transcript_is_relevant(24, Some(24)));
+        assert!(transcript_is_relevant(25, Some(24)));
+        assert!(transcript_is_relevant(20, None));
+    }
+
+    #[test]
+    fn acknowledgement_failure_keeps_capture_active_and_degrades_cleanup_health() {
+        let (capture_active, health) = capture_acknowledgement_failure(true, "segment");
+
+        assert!(capture_active);
+        assert_eq!(health.status, "DEGRADED");
+        assert!(
+            health
+                .message
+                .contains("segment cleanup acknowledgement failed")
+        );
+        assert!(!health.message.contains("stopped"));
+    }
+
+    #[test]
+    fn capture_restart_backoff_is_bounded_and_resets_after_success() {
+        let mut backoff = CaptureRestartBackoff::default();
+        let delays = (0..6).map(|_| backoff.next_delay()).collect::<Vec<_>>();
+
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+        );
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn capture_restart_policy_distinguishes_failure_from_normal_stop() {
+        assert!(capture_stop_should_restart(
+            CaptureStopReason::ControllerDropped
+        ));
+        assert!(!capture_stop_should_restart(CaptureStopReason::EndOfStream));
+        assert!(!capture_stop_should_restart(CaptureStopReason::Requested));
+    }
+
+    #[test]
+    fn capture_recovery_state_allows_only_one_restart_and_resets_after_success() {
+        let mut recovery = CaptureRecoveryState::default();
+
+        assert_eq!(recovery.schedule(), Some(Duration::from_secs(2)));
+        assert_eq!(recovery.schedule(), None);
+        recovery.finish(false);
+        assert_eq!(recovery.schedule(), Some(Duration::from_secs(4)));
+        recovery.finish(true);
+        assert_eq!(recovery.restart_count(), 1);
+        assert_eq!(recovery.schedule(), Some(Duration::from_secs(2)));
+        recovery.cancel();
+        assert!(!recovery.is_pending());
+    }
+
+    #[test]
+    fn capture_generation_qualifies_restarted_sequences_without_changing_local_offset() {
+        let qualified = qualify_capture_sequence(1, 23).unwrap();
+
+        assert_eq!(qualified, (1_u64 << 32) | 23);
+        assert_eq!(capture_local_sequence(qualified), 23);
+        assert!(qualify_capture_sequence(1, u64::from(u32::MAX) + 1).is_none());
+    }
+
+    #[test]
+    fn capture_recovery_keeps_overall_health_degraded_until_live_edge_returns() {
+        let healthy = component("HEALTHY", "ok");
+        let mut health = HealthView {
+            stream_capture: healthy.clone(),
+            transcription: healthy.clone(),
+            gemini: healthy.clone(),
+            market_feed: healthy.clone(),
+            persistence: healthy,
+            ..HealthView::default()
+        };
+
+        health.stream_capture = component("RECOVERING", "retry scheduled");
+
+        assert_eq!(overall_health(&health), "DEGRADED");
+    }
+
     #[test]
     fn expiry_parser_accepts_model_and_human_forms() {
         let expected = NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
         assert_eq!(parse_expiry("2026-08-13").unwrap(), expected);
         assert_eq!(parse_expiry("13 Aug 2026").unwrap(), expected);
+        assert_eq!(parse_expiry("13 AUG 26").unwrap(), expected);
         assert_eq!(parse_expiry("13/08/2026").unwrap(), expected);
     }
 
@@ -3425,6 +4346,80 @@ mod tests {
     }
 
     #[test]
+    fn analysis_bot_state_reports_the_authoritative_pending_lifecycle() {
+        let mut broker = PaperBroker::with_accounts(
+            PaperBrokerConfig::default(),
+            vec![AccountSpec {
+                account_id: "account_1".to_owned(),
+                display_name: "Account 1".to_owned(),
+                starting_capital_paise: 2_000_000,
+            }],
+        )
+        .unwrap();
+        let setup = TradeSetup {
+            setup_id: "setup-1".to_owned(),
+            contract: PaperContract {
+                instrument_id: "NFO:101".to_owned(),
+                trading_symbol: "NIFTY-20990813-25000-CE".to_owned(),
+                underlying: PaperUnderlying::Nifty,
+                expiry: "2099-08-13".to_owned(),
+                strike_paise: 2_500_000,
+                option_kind: OptionKind::Ce,
+            },
+            side: TradeSide::Buy,
+            levels: PaperLevels {
+                entry_paise: 10_000,
+                hard_sl_paise: 9_000,
+                t1_paise: 11_000,
+                t2_paise: Some(12_000),
+            },
+            evidence_timestamp_ms: 1_000,
+            received_timestamp_ms: 1_000,
+        };
+        assert_eq!(broker.place_setup(setup, 1_000).orders_placed, 2);
+
+        let state = bot_state_from_snapshot(&broker.snapshot(1_000));
+
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.open.is_empty());
+        assert_eq!(state.pending[0].event_id, "paper:setup-1:entry");
+        assert_eq!(state.pending[0].trade_id.as_deref(), Some("setup-1"));
+        assert_eq!(state.pending[0].status, BotActionStatus::Pending);
+    }
+
+    #[test]
+    fn runtime_action_outcome_is_written_back_as_authoritative_memory() {
+        let mut context = gemini::RollingContext::default();
+        let action = TradeAction {
+            action: ActionKind::Watch,
+            episode_id: Some("episode-1".to_owned()),
+            event_id: Some("watch-1".to_owned()),
+            trade_id: None,
+            contract: None,
+            levels: None,
+            evidence_timestamps: Vec::new(),
+            rationale: "watch this contract".to_owned(),
+        };
+
+        reconcile_runtime_action_outcome(
+            &mut context,
+            &action,
+            false,
+            "",
+            "instrument routing rejected",
+            Utc.timestamp_millis_opt(2_000).single().unwrap(),
+        );
+
+        assert_eq!(context.bot_outcomes.len(), 1);
+        assert_eq!(context.bot_outcomes[0].event_id, "watch-1");
+        assert_eq!(context.bot_outcomes[0].status, BotActionStatus::Rejected);
+        assert_eq!(
+            context.bot_outcomes[0].episode_id.as_deref(),
+            Some("episode-1")
+        );
+    }
+
+    #[test]
     fn rolling_entry_event_tracks_actual_paper_placement_outcome() {
         let mut context = gemini::RollingContext {
             episodes: vec![gemini::TradeEpisodeContext {
@@ -3436,7 +4431,6 @@ mod tests {
                 entry_event_id: Some("event-1".to_owned()),
                 first_seen_at: String::new(),
                 last_updated_at: String::new(),
-                confidence_pct: 80,
             }],
             ..gemini::RollingContext::default()
         };
@@ -3447,7 +4441,6 @@ mod tests {
             trade_id: None,
             contract: None,
             levels: None,
-            confidence_pct: 80,
             evidence_timestamps: Vec::new(),
             rationale: "enter now".to_owned(),
         };
@@ -3482,7 +4475,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_context_envelope_requires_exact_stream_date_schema_and_timestamp() {
+    fn stream_context_envelope_accepts_completed_media_with_a_future_recorded_end_time() {
         let clip_end = Utc.with_ymd_and_hms(2026, 8, 11, 5, 0, 0).single().unwrap();
         let mut envelope = StreamContextEnvelope {
             schema_version: STREAM_CONTEXT_SCHEMA_VERSION,
@@ -3515,8 +4508,11 @@ mod tests {
             "2026-08-11",
         ));
         envelope.schema_version = STREAM_CONTEXT_SCHEMA_VERSION;
+        // Capture completion is authoritative: a media timestamp may be a few
+        // seconds ahead of wall clock when FFmpeg finalizes a segment. A fast
+        // valid Gemini result must not be discarded for that reason.
         envelope.updated_at = clip_end - chrono::Duration::milliseconds(1);
-        assert!(!stream_context_envelope_matches(
+        assert!(stream_context_envelope_matches(
             &envelope,
             "https://www.youtube.com/watch?v=test",
             "2026-08-11",
@@ -3554,6 +4550,7 @@ mod tests {
             transcripts: Vec::new(),
             watched_options: Vec::new(),
             open_trades: Vec::new(),
+            bot_state: BotStateSnapshot::default(),
             rolling_context: None,
         };
         let completed = GeminiCompleted {
@@ -3571,7 +4568,6 @@ mod tests {
             trade_id: None,
             contract: None,
             levels: None,
-            confidence_pct: 80,
             evidence_timestamps: vec![gemini::EvidenceTimestamp {
                 seconds_from_clip_start: 7.0,
                 source: gemini::EvidenceSource::Both,
@@ -3609,5 +4605,22 @@ mod tests {
         );
         action.action = ActionKind::Hold;
         assert!(executable_action_freshness_issue(&action, &completed, stale_now).is_none());
+    }
+
+    #[test]
+    fn gemini_pipeline_audit_serializes_reasoning_latency() {
+        let event = RuntimeAuditEvent::Pipeline {
+            timestamp: "2026-08-13T00:00:00Z".to_owned(),
+            component: "gemini".to_owned(),
+            status: "complete".to_owned(),
+            detail: "analysis complete in 1234 ms".to_owned(),
+            latency_ms: Some(1234),
+        };
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(
+            value.get("latency_ms").and_then(|value| value.as_u64()),
+            Some(1234)
+        );
     }
 }

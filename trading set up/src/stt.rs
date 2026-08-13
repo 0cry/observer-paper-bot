@@ -26,9 +26,10 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-pub const SEGMENT_SECONDS: f64 = 4.0;
-pub const WINDOW_CHUNKS: usize = 2;
+pub const SEGMENT_SECONDS: f64 = 5.0;
+pub const WINDOW_CHUNKS: usize = 4;
 pub const DEFAULT_STT_CONCURRENCY: usize = 4;
+const MAX_STT_ATTEMPTS_PER_SEGMENT: usize = 2;
 
 const ELEVENLABS_STT_ENDPOINT: &str = "https://api.elevenlabs.io/v1/speech-to-text";
 const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
@@ -37,7 +38,7 @@ const TIMELINE_EPSILON_SECONDS: f64 = 0.001;
 
 static MULTIPART_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// One exact four-second input cut from the shared stream clock.
+/// One exact five-second input cut from the shared stream clock.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SegmentInput {
     pub index: u64,
@@ -91,7 +92,7 @@ pub enum TranscriptFailure {
 }
 
 /// A timestamped provider token. Times are absolute on the stream timeline,
-/// not relative to the four-second file.
+/// not relative to the five-second file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WordTimestamp {
     pub text: String,
@@ -164,7 +165,7 @@ pub struct SttOptions {
     /// Maximum number of credential slots loaded from the vault, in file order.
     pub credential_limit: usize,
     /// Hard wall-clock deadline for an entire chunk, including queue time and
-    /// all credential rotations.
+    /// all credential fallback attempts.
     pub segment_timeout: Duration,
     /// Timeout for one provider attempt. The segment deadline remains the
     /// final upper bound.
@@ -180,8 +181,8 @@ impl Default for SttOptions {
         Self {
             concurrency: DEFAULT_STT_CONCURRENCY,
             credential_limit: 3,
-            segment_timeout: Duration::from_secs(20),
-            request_timeout: Duration::from_secs(15),
+            segment_timeout: Duration::from_secs(6),
+            request_timeout: Duration::from_secs(4),
             auth_cooldown: Duration::from_secs(15 * 60),
             quota_cooldown: Duration::from_secs(60),
             transient_cooldown: Duration::from_secs(5),
@@ -200,6 +201,9 @@ impl SttOptions {
         }
         if self.segment_timeout.is_zero() || self.request_timeout.is_zero() {
             bail!("STT timeouts must be greater than zero");
+        }
+        if self.request_timeout >= self.segment_timeout {
+            bail!("STT request timeout must be shorter than the segment deadline");
         }
         if !self.endpoint.starts_with("https://") && !self.endpoint.starts_with("http://") {
             bail!("STT endpoint must be HTTP or HTTPS");
@@ -237,7 +241,7 @@ struct KeySlot {
 #[derive(Debug)]
 struct KeyRingState {
     slots: Vec<KeySlot>,
-    cursor: usize,
+    active_index: usize,
 }
 
 #[derive(Debug)]
@@ -260,7 +264,7 @@ impl KeyRing {
                         last_failure: None,
                     })
                     .collect(),
-                cursor: 0,
+                active_index: 0,
             }),
         }
     }
@@ -272,12 +276,13 @@ impl KeyRing {
             return None;
         }
         let now = Instant::now();
+        let active_index = state.active_index % count;
         for offset in 0..count {
-            let index = (state.cursor + offset) % count;
+            let index = (active_index + offset) % count;
             let slot = &state.slots[index];
             if !attempted.contains(&index) && slot.cooldown_until <= now {
                 let key = slot.key.clone();
-                state.cursor = (index + 1) % count;
+                state.active_index = index;
                 return Some((index, key));
             }
         }
@@ -460,7 +465,7 @@ impl ElevenLabsSttClient {
             .collect()
     }
 
-    /// Transcribe one declared four-second segment. Operational failures are
+    /// Transcribe one declared five-second segment. Operational failures are
     /// returned as an incomplete chunk so downstream window construction never
     /// waits indefinitely or loses the segment's timeline position.
     pub async fn transcribe_segment(&self, segment: SegmentInput) -> TranscriptChunk {
@@ -479,8 +484,8 @@ impl ElevenLabsSttClient {
         }
     }
 
-    /// Transcribe an 8-second window as two exact, consecutive four-second
-    /// chunks. Both requests run concurrently (subject to the global
+    /// Transcribe a 20-second window as four exact, consecutive five-second
+    /// chunks. All four requests run concurrently (subject to the global
     /// semaphore), and the returned chunks are always in chronological order.
     pub async fn transcribe_window(
         &self,
@@ -530,6 +535,9 @@ impl ElevenLabsSttClient {
         let mut last_failure = TranscriptFailure::CredentialsCoolingDown;
 
         loop {
+            if attempted.len() >= MAX_STT_ATTEMPTS_PER_SEGMENT {
+                return TranscriptChunk::incomplete(segment, last_failure);
+            }
             let Some((slot_index, key)) = self.inner.keys.next_available(&attempted).await else {
                 if self.inner.keys.has_unattempted_key(&attempted).await {
                     last_failure = TranscriptFailure::CredentialsCoolingDown;
@@ -932,7 +940,7 @@ fn media_type_for_extension(extension: &str) -> &'static str {
         "webm" => "audio/webm",
         "mp4" => "video/mp4",
         // FFmpeg's segment muxer writes MPEG-2 transport stream chunks.  Use
-        // the registered media type so Scribe receives the four-second `.ts`
+        // the registered media type so Scribe receives the five-second `.ts`
         // segment as media instead of an opaque binary upload.
         "ts" => "video/mp2t",
         "mov" => "video/quicktime",
@@ -944,6 +952,57 @@ fn media_type_for_extension(extension: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap as AxumHeaderMap, StatusCode},
+        routing::post,
+    };
+    use chrono::Utc;
+    use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Clone)]
+    struct TestSttEndpointState {
+        requests: Arc<AtomicUsize>,
+    }
+
+    async fn test_stt_endpoint(
+        State(state): State<TestSttEndpointState>,
+        headers: AxumHeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        let key = headers
+            .get("xi-api-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if key == "test-key-2" {
+            (
+                StatusCode::OK,
+                Json(json!({"text": "third key must not be reached", "words": []})),
+            )
+        } else {
+            (StatusCode::UNAUTHORIZED, Json(json!({"detail": "test"})))
+        }
+    }
+
+    async fn spawn_test_stt_endpoint() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/speech-to-text", post(test_stt_endpoint))
+            .with_state(TestSttEndpointState {
+                requests: requests.clone(),
+            });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/speech-to-text"), requests, task)
+    }
 
     fn segment(index: u64) -> SegmentInput {
         let start_sec = index as f64 * SEGMENT_SECONDS;
@@ -956,14 +1015,62 @@ mod tests {
     }
 
     #[test]
-    fn transcription_contract_is_two_four_second_chunks() {
-        assert_eq!(SEGMENT_SECONDS, 4.0);
-        assert_eq!(WINDOW_CHUNKS, 2);
+    fn transcription_contract_is_four_five_second_chunks() {
+        assert_eq!(SEGMENT_SECONDS, 5.0);
+        assert_eq!(WINDOW_CHUNKS, 4);
+    }
+
+    #[tokio::test]
+    async fn successful_stt_key_selection_stays_on_the_same_slot() {
+        let ring = KeyRing::new(vec![
+            SecretKey(Arc::from("test-key-0")),
+            SecretKey(Arc::from("test-key-1")),
+            SecretKey(Arc::from("test-key-2")),
+        ]);
+        let attempted = HashSet::new();
+
+        let (first_slot, _) = ring.next_available(&attempted).await.unwrap();
+        ring.record_success(first_slot).await;
+        let (second_slot, _) = ring.next_available(&attempted).await.unwrap();
+        ring.record_success(second_slot).await;
+        let (third_slot, _) = ring.next_available(&attempted).await.unwrap();
+
+        assert_eq!([first_slot, second_slot, third_slot], [0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn failed_stt_key_moves_to_a_sticky_fallback_slot() {
+        let ring = KeyRing::new(vec![
+            SecretKey(Arc::from("test-key-0")),
+            SecretKey(Arc::from("test-key-1")),
+            SecretKey(Arc::from("test-key-2")),
+        ]);
+        let attempted = HashSet::new();
+
+        let (primary_slot, _) = ring.next_available(&attempted).await.unwrap();
+        ring.record_failure(primary_slot, "QUOTA", Duration::from_secs(60))
+            .await;
+        let (fallback_slot, _) = ring.next_available(&attempted).await.unwrap();
+        ring.record_success(fallback_slot).await;
+        let (next_slot, _) = ring.next_available(&attempted).await.unwrap();
+
+        assert_eq!(primary_slot, 0);
+        assert_eq!(fallback_slot, 1);
+        assert_eq!(next_slot, fallback_slot);
+    }
+
+    #[test]
+    fn default_deadlines_bound_a_stalled_segment_near_one_capture_interval() {
+        let options = SttOptions::default();
+
+        assert_eq!(options.request_timeout, Duration::from_secs(4));
+        assert_eq!(options.segment_timeout, Duration::from_secs(6));
+        assert!(options.request_timeout < options.segment_timeout);
     }
 
     #[test]
     fn parses_and_deduplicates_supported_key_shapes_without_exposable_debug() {
-        let first = "sk_0123456789abcdefghijklmnop";
+        let first = ["sk", "_0123456789abcdefghijklmnop"].concat();
         let second = "0123456789ABCDEF0123456789ABCDEF";
         let contents =
             format!("ELEVENLABS_API_KEY={first}\nduplicate: '{first}'\nhex={second}\nshort=sk_bad");
@@ -972,15 +1079,18 @@ mod tests {
 
         assert_eq!(keys.len(), 2);
         let debug = format!("{keys:?}");
-        assert!(!debug.contains(first));
+        assert!(!debug.contains(&first));
         assert!(!debug.contains(second));
         assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]
     fn assembles_window_in_order_and_marks_a_missing_chunk_incomplete() {
-        let expected = [segment(40), segment(41)];
-        let completed = vec![TranscriptChunk::test_complete(&expected[0], "one")];
+        let expected = [segment(40), segment(41), segment(42), segment(43)];
+        let completed = vec![
+            TranscriptChunk::test_complete(&expected[2], "three"),
+            TranscriptChunk::test_complete(&expected[0], "one"),
+        ];
 
         let window = assemble_window(&expected, completed);
 
@@ -990,16 +1100,18 @@ mod tests {
                 .iter()
                 .map(|chunk| chunk.index)
                 .collect::<Vec<_>>(),
-            vec![40, 41]
+            vec![40, 41, 42, 43]
         );
         assert_eq!(window.chunks[1].status, TranscriptStatus::Incomplete);
         assert_eq!(
             window.chunks[1].failure,
             Some(TranscriptFailure::MissingResult)
         );
-        assert_eq!(window.incomplete_count, 1);
+        assert_eq!(window.incomplete_count, 2);
         assert!(!window.complete);
-        assert_eq!(window.text, "one");
+        assert_eq!(window.text, "one three");
+        assert_eq!(window.start_sec, 200.0);
+        assert_eq!(window.end_sec, 220.0);
     }
 
     #[test]
@@ -1034,12 +1146,42 @@ mod tests {
     }
 
     #[test]
-    fn exact_window_requires_two_contiguous_four_second_chunks() {
-        let mut segments = [segment(0), segment(1)];
+    fn exact_window_requires_four_contiguous_five_second_chunks() {
+        let mut segments = [segment(0), segment(1), segment(2), segment(3)];
         assert!(valid_window_layout(&segments));
 
         segments[1].start_sec += 0.01;
         segments[1].end_sec += 0.01;
         assert!(!valid_window_layout(&segments));
+    }
+
+    #[tokio::test]
+    async fn one_segment_never_walks_a_third_credential() {
+        let (endpoint, requests, server) = spawn_test_stt_endpoint().await;
+        let mut options = SttOptions::default();
+        options.endpoint = endpoint;
+        options.segment_timeout = Duration::from_secs(2);
+        options.request_timeout = Duration::from_millis(500);
+        options.auth_cooldown = Duration::from_millis(10);
+        let client = ElevenLabsSttClient::from_keys_with_options(
+            ["test-key-0", "test-key-1", "test-key-2"],
+            options,
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "observer-stt-two-attempt-{}-{}.ts",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        tokio::fs::write(&path, b"test media").await.unwrap();
+        let input = SegmentInput::new(0, 0.0, SEGMENT_SECONDS, path.clone());
+
+        let transcript = client.transcribe_segment(input).await;
+
+        let _ = tokio::fs::remove_file(path).await;
+        server.abort();
+        assert_eq!(transcript.status, TranscriptStatus::Incomplete);
+        assert_eq!(transcript.failure, Some(TranscriptFailure::Authentication));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 }
