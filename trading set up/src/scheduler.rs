@@ -321,14 +321,21 @@ async fn discover_live_url(
         .arg("%(id)s\t%(live_status)s\t%(webpage_url)s")
         .arg(live_page)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     let output = timeout(Duration::from_secs(45), command.output())
         .await
         .context("yt-dlp discovery timed out")?
         .context("could not execute yt-dlp discovery")?;
     if !output.status.success() {
-        bail!("yt-dlp discovery exited with status {}", output.status);
+        let detail = bounded_yt_dlp_failure_detail(&output.stderr);
+        if detail.is_empty() {
+            bail!("yt-dlp discovery exited with status {}", output.status);
+        }
+        bail!(
+            "yt-dlp discovery exited with status {}: {detail}",
+            output.status
+        );
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
@@ -338,6 +345,54 @@ async fn discover_live_url(
         }
     }
     Ok(None)
+}
+
+/// Keeps process diagnostics useful without exposing signed media URLs or terminal control text.
+pub(crate) fn bounded_yt_dlp_failure_detail(stderr: &[u8]) -> String {
+    let mut clean = String::new();
+    let mut in_escape = false;
+    let mut csi_escape = false;
+    for character in String::from_utf8_lossy(stderr).chars() {
+        if in_escape {
+            if !csi_escape && character == '[' {
+                csi_escape = true;
+                continue;
+            }
+            if (csi_escape && ('@'..='~').contains(&character))
+                || (!csi_escape && character.is_ascii_alphabetic())
+            {
+                in_escape = false;
+                csi_escape = false;
+            }
+            continue;
+        }
+        if character == '\u{1b}' {
+            in_escape = true;
+            csi_escape = false;
+        } else if character.is_ascii_graphic() || character.is_ascii_whitespace() {
+            clean.push(character);
+        }
+    }
+    let mut words = Vec::new();
+    let mut length = 0usize;
+    for word in clean.split_whitespace() {
+        let replacement = if word.starts_with("https://") || word.starts_with("http://") {
+            "[URL redacted]"
+        } else {
+            word
+        };
+        length += replacement.len() + usize::from(!words.is_empty());
+        words.push(replacement);
+        if length >= 480 {
+            break;
+        }
+    }
+    let message = words.join(" ");
+    if message.len() <= 480 {
+        message
+    } else {
+        format!("{}...", &message[..477])
+    }
 }
 
 fn parse_live_page(html: &str) -> Option<String> {
@@ -636,5 +691,17 @@ mod tests {
         let ended = r#"<link rel="canonical" href="https://www.youtube.com/watch?v=jVNOcCob0m8">
             <meta itemprop="isLiveBroadcast" content="False">"#;
         assert_eq!(parse_live_page(ended), None);
+    }
+
+    #[test]
+    fn yt_dlp_failure_detail_is_bounded_and_redacts_urls() {
+        let detail = bounded_yt_dlp_failure_detail(
+            b"ERROR: Sign in to confirm you\x1b[31m are not a bot\nhttps://example.test/secret?token=abc",
+        );
+
+        assert_eq!(
+            detail,
+            "ERROR: Sign in to confirm you are not a bot [URL redacted]"
+        );
     }
 }
