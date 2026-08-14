@@ -317,6 +317,8 @@ async fn discover_live_url(
         .arg("--no-warnings")
         .arg("--no-playlist")
         .arg("--skip-download")
+        .arg("--extractor-args")
+        .arg(youtube_player_client_fallback())
         .arg("--print")
         .arg("%(id)s\t%(live_status)s\t%(webpage_url)s")
         .arg(live_page)
@@ -345,6 +347,10 @@ async fn discover_live_url(
         }
     }
     Ok(None)
+}
+
+pub(crate) fn youtube_player_client_fallback() -> &'static str {
+    "youtube:player_client=android_vr"
 }
 
 /// Keeps process diagnostics useful without exposing signed media URLs or terminal control text.
@@ -702,6 +708,14 @@ mod tests {
         assert_eq!(
             detail,
             "ERROR: Sign in to confirm you are not a bot [URL redacted]"
+        );
+    }
+
+    #[test]
+    fn youtube_client_fallback_uses_the_live_stream_compatible_android_vr_client() {
+        assert_eq!(
+            youtube_player_client_fallback(),
+            "youtube:player_client=android_vr"
         );
     }
 }
