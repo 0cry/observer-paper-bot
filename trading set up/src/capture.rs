@@ -1,13 +1,13 @@
 //! Bounded, timestamped media capture for a live YouTube stream.
 //!
 //! The module owns one long-running FFmpeg ingest process. FFmpeg writes closed
-//! four-second MPEG-TS segments; every two consecutive segments are remuxed
-//! into one 8-second MP4. Callers must acknowledge segment and window events.
-//! A segment is only removed after it has been acknowledged by the caller and
-//! has also been consumed by the internal window assembler.
+//! three-second MPEG-TS source segments. Callers acknowledge each segment only
+//! after the blocker/analysis lifecycle has released it, so the exact final
+//! source frame remains available for a later sparse-image extraction step.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    ffi::OsString,
     fmt,
     fs::File,
     path::{Path, PathBuf},
@@ -27,13 +27,20 @@ use tokio::{
     time::{MissedTickBehavior, interval, timeout},
 };
 
-pub const SEGMENT_SECONDS: u64 = 4;
-pub const WINDOW_SEGMENTS: usize = 2;
+pub const SEGMENT_SECONDS: u64 = 3;
+pub const WINDOW_SEGMENTS: usize = 4;
 pub const WINDOW_SECONDS: u64 = SEGMENT_SECONDS * WINDOW_SEGMENTS as u64;
-const CAPTURE_VIDEO_FPS: u64 = 5;
-const KEYFRAME_INTERVAL_FRAMES: u64 = SEGMENT_SECONDS * CAPTURE_VIDEO_FPS;
 pub const DEFAULT_CLIP_RETENTION: usize = 3;
-pub const GEMINI_INLINE_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_INLINE_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
+/// Maximum in-memory sparse analysis frame. The original 720p JPEG is never
+/// downscaled and is deleted immediately after the caller receives its bytes.
+pub const MAX_ANALYSIS_JPEG_BYTES: u64 = 8 * 1024 * 1024;
+/// Capture is normalized to this CFR before segmenting. Keep the GOP and
+/// forced-keyframe interval derived from `SEGMENT_SECONDS` so each new source
+/// segment begins at a decodable keyframe boundary.
+const CAPTURE_FPS: u64 = 5;
+const CAPTURE_GOP_FRAMES: u64 = CAPTURE_FPS * SEGMENT_SECONDS;
+const ANALYSIS_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 const STALE_CAPTURE_GRACE: Duration = Duration::from_secs(WINDOW_SECONDS * 2);
 const CAPTURE_LOCK_FILE: &str = ".capture.lock";
 
@@ -75,7 +82,7 @@ impl Default for CaptureConfig {
             max_inflight_segments: 24,
             max_inflight_windows: 8,
             clip_retention: DEFAULT_CLIP_RETENTION,
-            max_clip_bytes: GEMINI_INLINE_LIMIT_BYTES,
+            max_clip_bytes: MAX_INLINE_MEDIA_BYTES,
         }
     }
 }
@@ -99,7 +106,7 @@ impl CaptureConfig {
         if self.event_queue_capacity == 0
             || self.control_queue_capacity == 0
             || self.max_segments_per_poll == 0
-            || self.max_inflight_segments < WINDOW_SEGMENTS
+            || self.max_inflight_segments == 0
             || self.max_inflight_windows == 0
             || self.clip_retention == 0
             || self.max_clip_bytes == 0
@@ -110,7 +117,7 @@ impl CaptureConfig {
     }
 }
 
-/// A closed, immutable four-second audio/video segment.
+/// A closed, immutable three-second audio/video source segment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaSegment {
     pub id: String,
@@ -122,7 +129,90 @@ pub struct MediaSegment {
     pub size_bytes: u64,
 }
 
-/// Two consecutive segments published as an optimized 8-second MP4.
+/// Select the latest source segment by capture chronology. A dispatch may hold
+/// non-consecutive retained clips, so list position must never choose the frame.
+pub fn latest_selected_segment(segments: &[MediaSegment]) -> Option<&MediaSegment> {
+    segments.iter().max_by(|left, right| {
+        left.ended_at_utc
+            .cmp(&right.ended_at_utc)
+            .then_with(|| left.sequence.cmp(&right.sequence))
+    })
+}
+
+/// Arguments for extracting the final usable source frame without a filter or
+/// scale step. Kept separate so resolution/selection remain unit-testable.
+pub fn jpeg_frame_command_arguments(segment: &MediaSegment, output: &Path) -> Vec<String> {
+    vec![
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-nostdin".to_owned(),
+        "-y".to_owned(),
+        "-i".to_owned(),
+        segment.path.to_string_lossy().into_owned(),
+        "-map".to_owned(),
+        "0:v:0".to_owned(),
+        "-frames:v".to_owned(),
+        "1".to_owned(),
+        "-q:v".to_owned(),
+        "2".to_owned(),
+        output.to_string_lossy().into_owned(),
+    ]
+}
+
+/// Extract a single original-resolution JPEG from the chronological latest
+/// selected source segment. FFmpeg writes to disk first, allowing a strict
+/// size check before bounded in-memory loading. No frame is persisted.
+pub async fn extract_latest_selected_jpeg(
+    ffmpeg_path: &Path,
+    segments: &[MediaSegment],
+) -> Result<Vec<u8>> {
+    let segment = latest_selected_segment(segments)
+        .ok_or_else(|| anyhow!("cannot extract a frame without a selected source segment"))?;
+    let parent = segment.path.parent().unwrap_or_else(|| Path::new("."));
+    let output = parent.join(format!(
+        ".analysis_frame_{:09}_{}.jpg",
+        segment.sequence,
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let args = jpeg_frame_command_arguments(segment, &output);
+    let mut command = Command::new(ffmpeg_path);
+    command
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let result = async {
+        let status = timeout(ANALYSIS_FRAME_TIMEOUT, command.status())
+            .await
+            .map_err(|_| anyhow!("original-frame extraction timed out"))?
+            .context("could not start original-frame extraction")?;
+        if !status.success() {
+            bail!("original-frame extraction did not complete");
+        }
+        let metadata = fs::metadata(&output)
+            .await
+            .context("could not inspect extracted original frame")?;
+        if metadata.len() == 0 || metadata.len() > MAX_ANALYSIS_JPEG_BYTES {
+            bail!("extracted original frame exceeds bounded memory limit");
+        }
+        let bytes = fs::read(&output)
+            .await
+            .context("could not load extracted original frame")?;
+        if bytes.len() as u64 > MAX_ANALYSIS_JPEG_BYTES {
+            bail!("extracted original frame exceeds bounded memory limit");
+        }
+        Ok::<Vec<u8>, anyhow::Error>(bytes)
+    }
+    .await;
+    // The JPEG is only a request attachment. It must not remain on disk after
+    // success, timeout, process failure, or a bounded-read rejection.
+    let _ = fs::remove_file(&output).await;
+    result
+}
+
+/// Four consecutive segments published as an optimized 20-second MP4.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaWindow {
     pub id: String,
@@ -152,7 +242,6 @@ pub enum CaptureStopReason {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum CaptureEvent {
     SegmentReady(MediaSegment),
-    WindowReady(MediaWindow),
     Fault {
         at_utc: DateTime<Utc>,
         message: String,
@@ -175,8 +264,8 @@ impl fmt::Debug for CaptureController {
 }
 
 impl CaptureController {
-    /// Acknowledge that all external users of this four-second segment (for
-    /// example STT) have finished reading it.
+    /// Acknowledge that all external users of this source segment have
+    /// finished reading it.
     pub async fn acknowledge_segment(&self, segment_id: impl Into<String>) -> Result<()> {
         self.commands
             .send(CaptureCommand::AcknowledgeSegment(segment_id.into()))
@@ -184,7 +273,7 @@ impl CaptureController {
             .map_err(|_| anyhow!("capture worker is no longer running"))
     }
 
-    /// Acknowledge that downstream analysis has finished reading an 8-second
+    /// Acknowledge that downstream analysis has finished reading a 20-second
     /// MP4. Old acknowledged windows are eligible for latest-N rotation.
     pub async fn acknowledge_window(&self, window_id: impl Into<String>) -> Result<()> {
         self.commands
@@ -558,60 +647,7 @@ fn spawn_capture_process(
         .arg("512")
         .arg("-i")
         .arg(&stream.media_url)
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
-        .arg("0:a:0")
-        .arg("-vf")
-        .arg(format!(
-            "fps={CAPTURE_VIDEO_FPS},scale=-2:720:force_original_aspect_ratio=decrease:flags=fast_bilinear,format=yuv420p"
-        ))
-        .arg("-vsync")
-        .arg("cfr")
-        .arg("-c:v")
-        .arg("libx264")
-        .arg("-preset")
-        .arg("veryfast")
-        .arg("-tune")
-        .arg("zerolatency")
-        .arg("-crf")
-        .arg("30")
-        .arg("-maxrate")
-        .arg("700k")
-        .arg("-bufsize")
-        .arg("1400k")
-        .arg("-g")
-        .arg(KEYFRAME_INTERVAL_FRAMES.to_string())
-        .arg("-keyint_min")
-        .arg(KEYFRAME_INTERVAL_FRAMES.to_string())
-        .arg("-sc_threshold")
-        .arg("0")
-        .arg("-force_key_frames")
-        .arg(forced_keyframe_expression())
-        .arg("-c:a")
-        .arg("aac")
-        // Supports the older FFmpeg build already present on this machine.
-        .arg("-strict")
-        .arg("-2")
-        .arg("-b:a")
-        .arg("48k")
-        .arg("-ac")
-        .arg("1")
-        .arg("-ar")
-        .arg("16000")
-        .arg("-af")
-        .arg("aresample=async=1:first_pts=0")
-        .arg("-f")
-        .arg("segment")
-        .arg("-segment_format")
-        .arg("mpegts")
-        .arg("-segment_time")
-        .arg(SEGMENT_SECONDS.to_string())
-        .arg("-segment_time_delta")
-        .arg("0.05")
-        .arg("-reset_timestamps")
-        .arg("1")
-        .arg(output_pattern)
+        .args(capture_encoder_arguments(&output_pattern))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // Never leak the signed direct media URL through FFmpeg diagnostics.
@@ -625,8 +661,68 @@ fn spawn_capture_process(
     })
 }
 
-fn forced_keyframe_expression() -> String {
-    format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})")
+/// FFmpeg arguments after the source input. This is kept deterministic so the
+/// encoder and segmenter cadence cannot drift from the three-second source
+/// segment contract without a test failure.
+fn capture_encoder_arguments(output_pattern: &Path) -> Vec<OsString> {
+    [
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "0:a:0".into(),
+        "-vf".into(),
+        format!(
+            "fps={CAPTURE_FPS},scale=-2:720:force_original_aspect_ratio=decrease:flags=fast_bilinear,format=yuv420p"
+        )
+        .into(),
+        "-vsync".into(),
+        "cfr".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "veryfast".into(),
+        "-tune".into(),
+        "zerolatency".into(),
+        "-crf".into(),
+        "30".into(),
+        "-maxrate".into(),
+        "700k".into(),
+        "-bufsize".into(),
+        "1400k".into(),
+        "-g".into(),
+        CAPTURE_GOP_FRAMES.to_string().into(),
+        "-keyint_min".into(),
+        CAPTURE_GOP_FRAMES.to_string().into(),
+        "-sc_threshold".into(),
+        "0".into(),
+        "-force_key_frames".into(),
+        format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})").into(),
+        "-c:a".into(),
+        "aac".into(),
+        // Supports the older FFmpeg build already present on this machine.
+        "-strict".into(),
+        "-2".into(),
+        "-b:a".into(),
+        "48k".into(),
+        "-ac".into(),
+        "1".into(),
+        "-ar".into(),
+        "16000".into(),
+        "-af".into(),
+        "aresample=async=1:first_pts=0".into(),
+        "-f".into(),
+        "segment".into(),
+        "-segment_format".into(),
+        "mpegts".into(),
+        "-segment_time".into(),
+        SEGMENT_SECONDS.to_string().into(),
+        "-segment_time_delta".into(),
+        "0.05".into(),
+        "-reset_timestamps".into(),
+        "1".into(),
+        output_pattern.as_os_str().to_owned(),
+    ]
+    .to_vec()
 }
 
 struct SegmentLifecycle {
@@ -831,7 +927,10 @@ impl WorkerState {
                 SegmentLifecycle {
                     media: segment.clone(),
                     externally_acknowledged: false,
-                    assembled: false,
+                    // The obsolete MP4 assembler is deliberately not in the
+                    // active capture path. A segment becomes removable only
+                    // when the runtime sends its terminal acknowledgement.
+                    assembled: true,
                 },
             );
             self.next_segment += 1;
@@ -842,14 +941,6 @@ impl WorkerState {
                 self.config.event_send_timeout,
             )
             .await?;
-
-            let grouping = self.grouper.push(segment);
-            for abandoned in grouping.abandoned {
-                self.mark_assembled_and_maybe_delete(&abandoned.id).await?;
-            }
-            if let Some(group) = grouping.complete {
-                self.publish_window(group, events).await?;
-            }
         }
         Ok(())
     }
@@ -890,12 +981,8 @@ impl WorkerState {
             },
         );
         self.prune_clips().await?;
-        send_event(
-            events,
-            CaptureEvent::WindowReady(window),
-            self.config.event_send_timeout,
-        )
-        .await
+        let _ = events;
+        Ok(())
     }
 
     async fn acknowledge_segment(&mut self, id: &str) -> Result<()> {
@@ -1307,7 +1394,7 @@ async fn build_window(
     segments: &[MediaSegment],
 ) -> Result<MediaWindow> {
     if segments.len() != WINDOW_SEGMENTS {
-        bail!("a media window requires exactly two segments");
+        bail!("a media window requires exactly four segments");
     }
     for pair in segments.windows(2) {
         if pair[0].sequence.checked_add(1) != Some(pair[1].sequence)
@@ -1425,7 +1512,7 @@ async fn package_with_ffmpeg(
         .arg("-movflags")
         .arg("+faststart")
         .arg(output_path);
-    run_bounded_ffmpeg(config, command, "8-second clip packaging").await
+    run_bounded_ffmpeg(config, command, "20-second clip packaging").await
 }
 
 async fn compact_with_ffmpeg(
@@ -1633,77 +1720,70 @@ mod tests {
     }
 
     #[test]
-    fn capture_contract_is_two_four_second_segments_per_window() {
-        assert_eq!(SEGMENT_SECONDS, 4);
-        assert_eq!(WINDOW_SEGMENTS, 2);
-        assert_eq!(WINDOW_SECONDS, 8);
-        assert_eq!(KEYFRAME_INTERVAL_FRAMES, 20);
-        assert_eq!(forced_keyframe_expression(), "expr:gte(t,n_forced*4)");
-    }
-
-    #[test]
-    fn groups_exactly_two_consecutive_non_overlapping_segments() {
+    fn source_segment_contract_is_exactly_three_seconds() {
         let base = DateTime::parse_from_rfc3339("2026-08-11T03:16:40Z")
             .unwrap()
             .with_timezone(&Utc);
-        let mut grouper = SegmentGrouper::default();
-        let pending = grouper.push(segment(0, base));
-        assert!(pending.complete.is_none());
-        assert!(pending.abandoned.is_empty());
-        let first = grouper.push(segment(1, base)).complete.unwrap();
+        let source = segment(7, base);
+        assert_eq!(SEGMENT_SECONDS, 3);
+        assert_eq!(source.duration_ms, 3_000);
         assert_eq!(
-            first.iter().map(|item| item.sequence).collect::<Vec<_>>(),
-            vec![0, 1]
+            source
+                .ended_at_utc
+                .signed_duration_since(source.started_at_utc),
+            ChronoDuration::seconds(3)
         );
-        assert_eq!(first[0].started_at_utc, base);
-        assert_eq!(
-            first[1].ended_at_utc,
-            base + ChronoDuration::seconds(WINDOW_SECONDS as i64)
-        );
-
-        for sequence in 2..4 {
-            let result = grouper.push(segment(sequence, base));
-            if sequence == 3 {
-                assert_eq!(
-                    result
-                        .complete
-                        .unwrap()
-                        .iter()
-                        .map(|item| item.sequence)
-                        .collect::<Vec<_>>(),
-                    vec![2, 3]
-                );
-            } else {
-                assert!(result.complete.is_none());
-            }
-        }
     }
 
     #[test]
-    fn a_sequence_gap_drops_only_the_incomplete_group() {
+    fn capture_encoder_keyframes_align_with_three_second_segments() {
+        let arguments = capture_encoder_arguments(Path::new("segments/segment_%09d.ts"));
+        let values = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let value_after = |flag: &str| {
+            values
+                .windows(2)
+                .find_map(|pair| (pair[0] == flag).then(|| pair[1].as_str()))
+        };
+
+        assert_eq!(value_after("-segment_time"), Some("3"));
+        assert_eq!(value_after("-g"), Some("15"));
+        assert_eq!(value_after("-keyint_min"), Some("15"));
+        assert_eq!(
+            value_after("-force_key_frames"),
+            Some("expr:gte(t,n_forced*3)")
+        );
+    }
+
+    #[test]
+    fn latest_selected_segment_uses_chronologically_newest_source() {
         let base = DateTime::parse_from_rfc3339("2026-08-11T03:16:40Z")
             .unwrap()
             .with_timezone(&Utc);
-        let mut grouper = SegmentGrouper::default();
-        assert!(grouper.push(segment(0, base)).complete.is_none());
+        let oldest = segment(3, base);
+        let newest = segment(8, base);
+        assert_eq!(
+            latest_selected_segment(&[newest.clone(), oldest])
+                .unwrap()
+                .sequence,
+            8
+        );
+    }
 
-        let gap = grouper.push(segment(2, base));
-        assert_eq!(
-            gap.abandoned
+    #[test]
+    fn jpeg_frame_command_keeps_the_original_source_resolution() {
+        let segment = segment(9, Utc::now());
+        let output = PathBuf::from("frame.jpg");
+        let arguments = jpeg_frame_command_arguments(&segment, &output);
+        assert!(arguments.windows(2).any(|pair| pair == ["-frames:v", "1"]));
+        assert!(
+            !arguments
                 .iter()
-                .map(|item| item.sequence)
-                .collect::<Vec<_>>(),
-            vec![0]
+                .any(|argument| argument == "-vf" || argument.contains("scale"))
         );
-        assert!(gap.complete.is_none());
-        let complete = grouper.push(segment(3, base)).complete.unwrap();
-        assert_eq!(
-            complete
-                .iter()
-                .map(|item| item.sequence)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
+        assert_eq!(arguments.last().map(String::as_str), Some("frame.jpg"));
     }
 
     #[test]

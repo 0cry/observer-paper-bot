@@ -25,6 +25,31 @@ pub struct ServiceEventRow {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CronJobRow {
+    pub id: i64,
+    pub label: String,
+    /// Internal six-field expression with seconds pinned to zero.
+    pub expression: String,
+    pub target_url: String,
+    pub enabled: bool,
+    pub next_run_at: chrono::DateTime<chrono::Utc>,
+    pub last_status: Option<String>,
+    pub last_http_status: Option<i32>,
+    pub last_duration_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CronRunRow {
+    pub id: i64,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub status: String,
+    pub http_status: Option<i32>,
+    pub duration_ms: i64,
+    pub error: Option<String>,
+}
+
 pub(crate) fn normalize_service_event_limit(limit: Option<usize>) -> Result<usize> {
     let limit = limit.unwrap_or(DEFAULT_SERVICE_EVENT_LIMIT);
     if limit == 0 || limit > MAX_SERVICE_EVENT_LIMIT {
@@ -108,6 +133,39 @@ impl NeonStore {
         .execute(&self.pool)
         .await
         .context("could not create service_events")?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS cron_jobs (
+                id BIGSERIAL PRIMARY KEY,
+                label TEXT NOT NULL,
+                expression TEXT NOT NULL,
+                target_url TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                next_run_at TIMESTAMPTZ NOT NULL,
+                claimed_until TIMESTAMPTZ,
+                last_status TEXT,
+                last_http_status INTEGER,
+                last_duration_ms BIGINT,
+                last_error TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("could not create cron_jobs")?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS cron_job_runs (
+                id BIGSERIAL PRIMARY KEY,
+                cron_job_id BIGINT NOT NULL REFERENCES cron_jobs(id) ON DELETE CASCADE,
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                status TEXT NOT NULL,
+                http_status INTEGER,
+                duration_ms BIGINT NOT NULL,
+                error TEXT
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("could not create cron_job_runs")?;
         Ok(())
     }
 
@@ -276,6 +334,205 @@ impl NeonStore {
                 },
             )
             .collect())
+    }
+
+    pub async fn create_cron_job(&self, job: &crate::cron_jobs::NewCronJob) -> Result<CronJobRow> {
+        let row: (i64, String, String, String, bool, chrono::DateTime<chrono::Utc>, Option<String>, Option<i32>, Option<i64>, Option<String>) = sqlx::query_as(
+            r#"INSERT INTO cron_jobs (label, expression, target_url, enabled, next_run_at)
+               VALUES ($1, $2, $3, TRUE, $4)
+               RETURNING id, label, expression, target_url, enabled, next_run_at, last_status, last_http_status, last_duration_ms, last_error"#,
+        )
+        .bind(&job.label)
+        .bind(&job.expression)
+        .bind(&job.target_url)
+        .bind(job.next_run_at)
+        .fetch_one(&self.pool)
+        .await
+        .context("could not create cron job")?;
+        Ok(cron_job_from_row(row))
+    }
+
+    pub async fn list_cron_jobs(&self) -> Result<Vec<CronJobRow>> {
+        let rows: Vec<CronJobTuple> = sqlx::query_as(
+            r#"SELECT id, label, expression, target_url, enabled, next_run_at, last_status, last_http_status, last_duration_ms, last_error
+               FROM cron_jobs ORDER BY id DESC"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("could not list cron jobs")?;
+        Ok(rows.into_iter().map(cron_job_from_row).collect())
+    }
+
+    pub async fn set_cron_job_enabled(&self, id: i64, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE cron_jobs SET enabled = $2, claimed_until = NULL, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await
+            .context("could not update cron job")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_cron_job(&self, id: i64) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM cron_jobs WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("could not delete cron job")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn claim_due_cron_jobs(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        claim_seconds: i64,
+    ) -> Result<Vec<CronJobRow>> {
+        let claim_until = now + chrono::Duration::seconds(claim_seconds);
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("could not begin cron claim")?;
+        let rows: Vec<CronJobTuple> = sqlx::query_as(
+            r#"SELECT id, label, expression, target_url, enabled, next_run_at, last_status, last_http_status, last_duration_ms, last_error
+               FROM cron_jobs
+               WHERE enabled = TRUE AND next_run_at <= $1 AND (claimed_until IS NULL OR claimed_until < $1)
+               ORDER BY next_run_at ASC
+               FOR UPDATE SKIP LOCKED
+               LIMIT 16"#,
+        )
+        .bind(now)
+        .fetch_all(&mut *transaction)
+        .await
+        .context("could not claim due cron jobs")?;
+        for (id, ..) in &rows {
+            sqlx::query(
+                "UPDATE cron_jobs SET claimed_until = $2, updated_at = now() WHERE id = $1",
+            )
+            .bind(id)
+            .bind(claim_until)
+            .execute(&mut *transaction)
+            .await
+            .context("could not mark cron job claimed")?;
+        }
+        transaction
+            .commit()
+            .await
+            .context("could not commit cron claim")?;
+        Ok(rows.into_iter().map(cron_job_from_row).collect())
+    }
+
+    pub async fn finish_cron_job_run(
+        &self,
+        id: i64,
+        next_run_at: chrono::DateTime<chrono::Utc>,
+        status: &str,
+        http_status: Option<i32>,
+        duration_ms: i64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let error = error.map(|value| value.chars().take(512).collect::<String>());
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("could not begin cron finish")?;
+        sqlx::query(
+            "UPDATE cron_jobs SET next_run_at = $2, claimed_until = NULL, last_status = $3, last_http_status = $4, last_duration_ms = $5, last_error = $6, updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(next_run_at)
+        .bind(status)
+        .bind(http_status)
+        .bind(duration_ms)
+        .bind(error.as_deref())
+        .execute(&mut *transaction)
+        .await
+        .context("could not finish cron job")?;
+        sqlx::query("INSERT INTO cron_job_runs (cron_job_id, status, http_status, duration_ms, error) VALUES ($1, $2, $3, $4, $5)")
+            .bind(id)
+            .bind(status)
+            .bind(http_status)
+            .bind(duration_ms)
+            .bind(error.as_deref())
+            .execute(&mut *transaction)
+            .await
+            .context("could not record cron run")?;
+        sqlx::query("DELETE FROM cron_job_runs WHERE id NOT IN (SELECT id FROM cron_job_runs ORDER BY id DESC LIMIT 1000)")
+            .execute(&mut *transaction)
+            .await
+            .context("could not trim cron runs")?;
+        transaction
+            .commit()
+            .await
+            .context("could not commit cron result")?;
+        Ok(())
+    }
+
+    pub async fn list_cron_job_runs(&self, id: i64, limit: i64) -> Result<Vec<CronRunRow>> {
+        let rows = sqlx::query_as(
+            r#"SELECT id, occurred_at, status, http_status, duration_ms, error
+               FROM cron_job_runs WHERE cron_job_id = $1 ORDER BY id DESC LIMIT $2"#,
+        )
+        .bind(id)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await
+        .context("could not list cron job runs")?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, occurred_at, status, http_status, duration_ms, error)| CronRunRow {
+                    id,
+                    occurred_at,
+                    status,
+                    http_status,
+                    duration_ms,
+                    error,
+                },
+            )
+            .collect())
+    }
+}
+
+type CronJobTuple = (
+    i64,
+    String,
+    String,
+    String,
+    bool,
+    chrono::DateTime<chrono::Utc>,
+    Option<String>,
+    Option<i32>,
+    Option<i64>,
+    Option<String>,
+);
+
+fn cron_job_from_row(
+    (
+        id,
+        label,
+        expression,
+        target_url,
+        enabled,
+        next_run_at,
+        last_status,
+        last_http_status,
+        last_duration_ms,
+        last_error,
+    ): CronJobTuple,
+) -> CronJobRow {
+    CronJobRow {
+        id,
+        label,
+        expression,
+        target_url,
+        enabled,
+        next_run_at,
+        last_status,
+        last_http_status,
+        last_duration_ms,
+        last_error,
     }
 }
 

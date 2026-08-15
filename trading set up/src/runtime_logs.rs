@@ -108,7 +108,7 @@ mod tests {
         logger
             .record(
                 "ERROR",
-                "gemini",
+                "analysis",
                 "REQUEST_FAILED",
                 "request failed with AIza-secret-value at https://example.test/path?token=secret",
             )
@@ -116,12 +116,34 @@ mod tests {
 
         let logs = handle.snapshot().await.logs;
         assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].component, "gemini");
+        assert_eq!(logs[0].component, "analysis");
         assert_eq!(logs[0].code, "REQUEST_FAILED");
         assert!(logs[0].message.contains("[REDACTED]"));
         assert!(logs[0].message.contains("https://example.test/path"));
         assert!(!logs[0].message.contains("secret-value"));
         assert!(!logs[0].message.contains("token=secret"));
+    }
+
+    #[tokio::test]
+    async fn redacts_openai_standard_and_project_secret_shapes() {
+        let handle = DashboardHandle::new(DashboardState::empty());
+        let logger = RuntimeEventLogger::new(handle.clone(), None);
+        let standard = format!("sk-{}", "x".repeat(32));
+        let project = format!("sk-proj-{}", "y".repeat(32));
+
+        logger
+            .record(
+                "ERROR",
+                "analysis",
+                "REQUEST_FAILED",
+                &format!("provider rejected {standard} and {project}"),
+            )
+            .await;
+
+        let message = &handle.snapshot().await.logs[0].message;
+        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains(&standard));
+        assert!(!message.contains(&project));
     }
 
     #[test]

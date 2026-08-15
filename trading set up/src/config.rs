@@ -4,8 +4,8 @@
 //! The secret file path can be set with `OBSERVER_ENV_PATH`. On Windows it
 //! otherwise defaults to `%LOCALAPPDATA%\observer-trading\.env`. Process
 //! environment values take precedence over file values, except for
-//! `GEMINI_API_KEY`: when that key is present in the secret file, the file
-//! value is authoritative. Relative application paths are resolved against
+//! configured secret keys: when present in the secret file, the file value is
+//! authoritative. Relative application paths are resolved against
 //! the project directory, never against the caller's current working directory.
 
 use std::{
@@ -20,11 +20,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{NaiveDate, NaiveTime};
 use serde::{Deserialize, Serialize, Serializer};
 
-pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
 pub const DEFAULT_PAPER_ACCOUNTS: &str =
     "account_1:5000,account_2:10000,account_3:2000,account_4:15000,account_5:20000";
 pub const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:8787";
-pub const DEFAULT_GEMINI_KEY_NAMES: &str = "GEMINI_WORKING_01,GEMINI_WORKING_02,GEMINI_WORKING_03";
 pub const DEFAULT_API_KEY_LIMIT: usize = 3;
 
 /// A secret that is redacted both in debug output and Serde serialization.
@@ -69,7 +68,7 @@ impl Serialize for SecretString {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
-    pub gemini: GeminiConfig,
+    pub openai: OpenAiConfig,
     pub elevenlabs: ElevenLabsConfig,
     pub database: DatabaseConfig,
     pub broker: BrokerConfig,
@@ -100,8 +99,7 @@ pub struct DatabaseConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GeminiConfig {
-    pub api_key: SecretString,
+pub struct OpenAiConfig {
     pub api_keys: Vec<SecretString>,
     pub model: String,
 }
@@ -120,7 +118,6 @@ pub struct LotSizeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TradingConfig {
-    pub minimum_confidence_pct: f64,
     pub entry_buffer_points: f64,
     pub candidate_ttl_seconds: u64,
     pub charge_per_fill_rupees: f64,
@@ -167,7 +164,7 @@ impl AppConfig {
     /// `%LOCALAPPDATA%\observer-trading\.env`; other platforms rely on process
     /// environment variables unless an explicit path is configured.
     ///
-    /// An explicit `GEMINI_API_KEY` entry in the secret file is never replaced
+    /// An explicit OpenAI credential entry in the secret file is never replaced
     /// by an inherited process value. This prevents an unrelated shell/session
     /// credential from silently changing the account used by this project. A
     /// blank file entry remains authoritative and fails validation instead
@@ -186,8 +183,7 @@ impl AppConfig {
                 BTreeMap::new()
             };
 
-        let mut values = merge_project_and_environment(file_values, env::vars());
-        hydrate_gemini_credentials(project_dir, &mut values)?;
+        let values = merge_project_and_environment(file_values, env::vars());
         Self::from_values(project_dir, values)
     }
 
@@ -207,14 +203,14 @@ impl AppConfig {
     }
 
     fn from_map(project_dir: &Path, values: &BTreeMap<String, String>) -> Result<Self> {
-        let gemini_keys = configured_gemini_keys(values)?;
+        let openai_keys = configured_openai_keys(values)?;
         let elevenlabs_keys = configured_provider_keys(values, "ELEVENLABS_API_KEY")?;
-        let gemini_model = get(values, "GEMINI_MODEL")
-            .unwrap_or(DEFAULT_GEMINI_MODEL)
+        let openai_model = get(values, "OPENAI_MODEL")
+            .unwrap_or(DEFAULT_OPENAI_MODEL)
             .trim()
             .to_owned();
-        if gemini_model.is_empty() || gemini_model.contains('\r') || gemini_model.contains('\n') {
-            bail!("GEMINI_MODEL must be a non-empty single-line model name");
+        if openai_model.is_empty() || openai_model.contains('\r') || openai_model.contains('\n') {
+            bail!("OPENAI_MODEL must be a non-empty single-line model name");
         }
 
         let accounts = parse_accounts(
@@ -234,10 +230,9 @@ impl AppConfig {
         };
 
         let config = Self {
-            gemini: GeminiConfig {
-                api_key: gemini_keys[0].clone(),
-                api_keys: gemini_keys,
-                model: gemini_model,
+            openai: OpenAiConfig {
+                api_keys: openai_keys,
+                model: openai_model,
             },
             elevenlabs: ElevenLabsConfig {
                 api_keys: elevenlabs_keys,
@@ -259,7 +254,6 @@ impl AppConfig {
                 sensex: parse_or(values, "SENSEX_LOT_SIZE", 20)?,
             },
             trading: TradingConfig {
-                minimum_confidence_pct: parse_or(values, "MIN_TRADE_CONFIDENCE", 65.0)?,
                 entry_buffer_points: parse_or(values, "ENTRY_BUFFER_POINTS", 2.0)?,
                 candidate_ttl_seconds: parse_or(values, "CANDIDATE_TTL_SECONDS", 10)?,
                 charge_per_fill_rupees: parse_or(values, "CHARGE_PER_FILL", 20.0)?,
@@ -320,14 +314,13 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.gemini.api_keys.is_empty()
-            || self
-                .gemini
-                .api_keys
-                .iter()
-                .any(|key| key.expose_secret().trim().is_empty())
+        if self
+            .openai
+            .api_keys
+            .iter()
+            .any(|key| key.expose_secret().trim().is_empty())
         {
-            bail!("at least one non-empty Gemini API key is required");
+            bail!("configured OpenAI API keys must not be blank");
         }
         if self.elevenlabs.api_keys.is_empty()
             || self
@@ -376,11 +369,6 @@ impl AppConfig {
         }
         if self.lot_sizes.nifty > 10_000 || self.lot_sizes.sensex > 10_000 {
             bail!("lot sizes must not exceed 10000");
-        }
-        if !self.trading.minimum_confidence_pct.is_finite()
-            || !(0.0..=100.0).contains(&self.trading.minimum_confidence_pct)
-        {
-            bail!("MIN_TRADE_CONFIDENCE must be between 0 and 100");
         }
         if !self.trading.entry_buffer_points.is_finite() || self.trading.entry_buffer_points < 0.0 {
             bail!("ENTRY_BUFFER_POINTS must be a finite non-negative number");
@@ -464,22 +452,31 @@ fn parse_market_holidays(value: &str) -> Result<Vec<NaiveDate>> {
     Ok(dates)
 }
 
-fn configured_gemini_keys(values: &BTreeMap<String, String>) -> Result<Vec<SecretString>> {
-    let mut raw_keys = (1..=16)
-        .filter_map(|index| get(values, &format!("GEMINI_API_KEY_{index}")))
-        .filter(|value| !value.trim().is_empty())
+fn configured_openai_keys(values: &BTreeMap<String, String>) -> Result<Vec<SecretString>> {
+    let csv_keys = get(values, "OPENAI_API_KEYS")
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-
-    if raw_keys.is_empty()
-        && let Some(legacy) = get(values, "GEMINI_API_KEY").filter(|value| !value.trim().is_empty())
-    {
-        raw_keys.push(legacy.to_owned());
-    }
-    if raw_keys.is_empty() {
-        bail!("GEMINI_API_KEY is required and must not be empty (GEMINI_API_KEY_1 is preferred)");
-    }
-
+    let numbered_keys = (1..=16)
+        .filter_map(|index| get(values, &format!("OPENAI_API_KEY_{index}")))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let raw_keys = if !csv_keys.is_empty() {
+        csv_keys
+    } else if !numbered_keys.is_empty() {
+        numbered_keys
+    } else {
+        get(values, "OPENAI_API_KEY")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| vec![value.to_owned()])
+            .unwrap_or_default()
+    };
     let mut seen = HashSet::new();
     raw_keys
         .into_iter()
@@ -511,54 +508,6 @@ fn configured_provider_keys(
         .filter(|key| seen.insert(key.clone()))
         .map(SecretString::new)
         .collect()
-}
-
-fn hydrate_gemini_credentials(
-    project_dir: &Path,
-    values: &mut BTreeMap<String, String>,
-) -> Result<()> {
-    if get(values, "GEMINI_VAULT_PATH").is_none() {
-        return Ok(());
-    }
-
-    let vault_path = resolve_path(
-        project_dir,
-        required(values, "GEMINI_VAULT_PATH")?,
-        "GEMINI_VAULT_PATH",
-    )?;
-    let vault_text = fs::read_to_string(&vault_path).with_context(|| {
-        format!(
-            "could not read Gemini credential vault {}",
-            vault_path.display()
-        )
-    })?;
-    let vault = parse_dotenv(&vault_text).with_context(|| {
-        format!(
-            "could not parse Gemini credential vault {}",
-            vault_path.display()
-        )
-    })?;
-    let requested_names = get(values, "GEMINI_KEY_NAMES")
-        .unwrap_or(DEFAULT_GEMINI_KEY_NAMES)
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if requested_names.is_empty() || requested_names.len() > 16 {
-        bail!("GEMINI_KEY_NAMES must select between 1 and 16 credential names");
-    }
-
-    for (offset, name) in requested_names.into_iter().enumerate() {
-        let value = vault
-            .get(&name)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow!("Gemini credential vault is missing selected entry {name}"))?;
-        values
-            .entry(format!("GEMINI_API_KEY_{}", offset + 1))
-            .or_insert_with(|| value.clone());
-    }
-    Ok(())
 }
 
 fn external_env_path() -> Result<Option<PathBuf>> {
@@ -601,10 +550,15 @@ where
         .filter(|key| is_secret_environment_key(key))
         .cloned()
         .collect::<HashSet<_>>();
+    let project_pins_openai_group = project_values
+        .keys()
+        .any(|key| is_openai_credential_key(key));
 
     for (key, value) in environment_values {
         let key = key.into();
-        if pinned_secrets.contains(&key) {
+        if pinned_secrets.contains(&key)
+            || (project_pins_openai_group && is_openai_credential_key(&key))
+        {
             continue;
         }
         project_values.insert(key, value.into());
@@ -618,10 +572,15 @@ fn is_secret_environment_key(key: &str) -> bool {
         || key == "BROKER_CLIENT_ID"
         || key == "BROKER_MPIN"
         || key == "BROKER_TOTP_SECRET"
-        || key == "GEMINI_API_KEY"
-        || key.starts_with("GEMINI_API_KEY_")
+        || key == "OPENAI_API_KEY"
+        || key == "OPENAI_API_KEYS"
+        || key.starts_with("OPENAI_API_KEY_")
         || key == "ELEVENLABS_API_KEY"
         || key.starts_with("ELEVENLABS_API_KEY_")
+}
+
+fn is_openai_credential_key(key: &str) -> bool {
+    key == "OPENAI_API_KEY" || key == "OPENAI_API_KEYS" || key.starts_with("OPENAI_API_KEY_")
 }
 
 fn get<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
@@ -814,7 +773,7 @@ mod tests {
 
     fn config_with(values: &[(&str, &str)]) -> Result<AppConfig> {
         let mut injected = vec![
-            ("GEMINI_API_KEY", "test-secret-key"),
+            ("OPENAI_API_KEY", "test-secret-key"),
             ("ELEVENLABS_API_KEY", "test-elevenlabs-key"),
         ];
         injected.extend_from_slice(values);
@@ -825,7 +784,7 @@ mod tests {
     fn defaults_match_the_paper_trading_contract() {
         let config = config_with(&[]).unwrap();
 
-        assert_eq!(config.gemini.model, "gemini-3.5-flash-lite");
+        assert_eq!(config.openai.model, "gpt-5.6-luna");
         assert_eq!(
             config
                 .accounts
@@ -841,7 +800,6 @@ mod tests {
                 sensex: 20
             }
         );
-        assert_eq!(config.trading.minimum_confidence_pct, 65.0);
         assert_eq!(config.trading.entry_buffer_points, 2.0);
         assert_eq!(config.trading.candidate_ttl_seconds, 10);
         assert_eq!(config.trading.charge_per_fill_rupees, 20.0);
@@ -879,7 +837,6 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_or_impossible_values() {
-        assert!(config_with(&[("MIN_TRADE_CONFIDENCE", "101")]).is_err());
         assert!(config_with(&[("STT_CONCURRENCY", "0")]).is_err());
         assert!(config_with(&[("PAPER_ACCOUNTS", "same:5000,same:10000")]).is_err());
         assert!(config_with(&[("DASHBOARD_BIND", "127.0.0.1:0")]).is_err());
@@ -895,53 +852,56 @@ mod tests {
         assert!(!json.contains("test-secret-key"));
         assert!(debug.contains("[REDACTED]"));
         assert!(json.contains("[REDACTED]"));
-        assert_eq!(config.gemini.api_key.expose_secret(), "test-secret-key");
+        assert_eq!(config.openai.api_keys[0].expose_secret(), "test-secret-key");
     }
 
     #[test]
-    fn project_gemini_key_wins_while_environment_overrides_non_secret_settings() {
+    fn project_openai_key_wins_while_environment_overrides_non_secret_settings() {
         let project_values = BTreeMap::from([
-            ("GEMINI_API_KEY".to_owned(), "project-secret".to_owned()),
+            ("OPENAI_API_KEY".to_owned(), "project-secret".to_owned()),
             ("DASHBOARD_BIND".to_owned(), "127.0.0.1:8787".to_owned()),
         ]);
         let environment_values = [
-            ("GEMINI_API_KEY", "inherited-secret"),
+            ("OPENAI_API_KEY", "inherited-secret"),
             ("DASHBOARD_BIND", "127.0.0.1:9000"),
         ];
 
         let merged = merge_project_and_environment(project_values, environment_values);
 
-        assert_eq!(merged["GEMINI_API_KEY"], "project-secret");
+        assert_eq!(merged["OPENAI_API_KEY"], "project-secret");
         assert_eq!(merged["DASHBOARD_BIND"], "127.0.0.1:9000");
     }
 
     #[test]
-    fn inherited_gemini_key_is_used_only_when_project_does_not_define_it() {
+    fn inherited_openai_key_is_used_only_when_project_does_not_define_it() {
         let merged = merge_project_and_environment(
             BTreeMap::new(),
-            [("GEMINI_API_KEY", "inherited-secret")],
+            [("OPENAI_API_KEY", "inherited-secret")],
         );
 
-        assert_eq!(merged["GEMINI_API_KEY"], "inherited-secret");
+        assert_eq!(merged["OPENAI_API_KEY"], "inherited-secret");
     }
 
     #[test]
-    fn blank_project_gemini_key_is_not_masked_by_inherited_secret() {
+    fn blank_project_openai_key_allows_dashboard_only_runtime_credentials() {
         let merged = merge_project_and_environment(
-            BTreeMap::from([("GEMINI_API_KEY".to_owned(), String::new())]),
-            [("GEMINI_API_KEY", "inherited-secret")],
+            BTreeMap::from([
+                ("OPENAI_API_KEY".to_owned(), String::new()),
+                (
+                    "ELEVENLABS_API_KEY".to_owned(),
+                    "test-elevenlabs-key".to_owned(),
+                ),
+            ]),
+            [("OPENAI_API_KEY", "inherited-secret")],
         );
-        let error = AppConfig::from_values("C:/project", merged).unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains("GEMINI_API_KEY is required"));
-        assert!(!message.contains("inherited-secret"));
+        let config = AppConfig::from_values("C:/project", merged).unwrap();
+        assert!(config.openai.api_keys.is_empty());
     }
 
     #[test]
     fn invalid_secret_error_does_not_echo_the_secret() {
         let secret = "sensitive-first-line\nsensitive-second-line";
-        let error = AppConfig::from_values("C:/project", [("GEMINI_API_KEY", secret)]).unwrap_err();
+        let error = AppConfig::from_values("C:/project", [("OPENAI_API_KEY", secret)]).unwrap_err();
         let message = error.to_string();
 
         assert!(!message.contains("sensitive-first-line"));
@@ -954,15 +914,136 @@ mod tests {
         let values = parse_dotenv(
             r#"
                 # comment
-                export GEMINI_API_KEY="secret value" # comment
+                export OPENAI_API_KEY="secret value" # comment
                 DATA_DIR='C:\market data'
                 STT_CONCURRENCY=3 # worker limit
             "#,
         )
         .unwrap();
 
-        assert_eq!(values["GEMINI_API_KEY"], "secret value");
+        assert_eq!(values["OPENAI_API_KEY"], "secret value");
         assert_eq!(values["DATA_DIR"], r"C:\market data");
         assert_eq!(values["STT_CONCURRENCY"], "3");
+    }
+
+    #[test]
+    fn openai_numbered_keys_are_deduplicated_and_use_luna_default() {
+        let config = AppConfig::from_values(
+            "C:/project",
+            [
+                ("OPENAI_API_KEY_1", "openai-first"),
+                ("OPENAI_API_KEY_2", "openai-second"),
+                ("OPENAI_API_KEY_3", "openai-first"),
+                ("ELEVENLABS_API_KEY", "test-elevenlabs-key"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.openai.model, "gpt-5.6-luna");
+        assert_eq!(config.openai.api_keys.len(), 2);
+        assert_eq!(config.openai.api_keys[0].expose_secret(), "openai-first");
+    }
+
+    #[test]
+    fn legacy_gemini_only_configuration_starts_with_no_openai_slots() {
+        let config = AppConfig::from_values(
+            "C:/project",
+            [
+                ("GEMINI_API_KEY", "legacy-gemini-key"),
+                ("ELEVENLABS_API_KEY", "test-elevenlabs-key"),
+            ],
+        )
+        .unwrap();
+
+        assert!(config.openai.api_keys.is_empty());
+    }
+
+    #[test]
+    fn project_numbered_openai_key_blocks_inherited_csv_aliases() {
+        let merged = merge_project_and_environment(
+            BTreeMap::from([("OPENAI_API_KEY_1".to_owned(), "project-key".to_owned())]),
+            [
+                ("OPENAI_API_KEYS", "inherited-one,inherited-two"),
+                ("OPENAI_API_KEY", "inherited-legacy"),
+                ("OPENAI_API_KEY_2", "inherited-numbered"),
+            ],
+        );
+
+        assert_eq!(
+            merged.get("OPENAI_API_KEY_1"),
+            Some(&"project-key".to_owned())
+        );
+        assert!(!merged.contains_key("OPENAI_API_KEYS"));
+        assert!(!merged.contains_key("OPENAI_API_KEY"));
+        assert!(!merged.contains_key("OPENAI_API_KEY_2"));
+    }
+
+    #[test]
+    fn project_openai_csv_blocks_inherited_numbered_aliases() {
+        let merged = merge_project_and_environment(
+            BTreeMap::from([(
+                "OPENAI_API_KEYS".to_owned(),
+                "project-one,project-two".to_owned(),
+            )]),
+            [
+                ("OPENAI_API_KEY_1", "inherited-numbered"),
+                ("OPENAI_API_KEY", "inherited-legacy"),
+            ],
+        );
+
+        assert_eq!(
+            merged.get("OPENAI_API_KEYS"),
+            Some(&"project-one,project-two".to_owned())
+        );
+        assert!(!merged.contains_key("OPENAI_API_KEY_1"));
+        assert!(!merged.contains_key("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn openai_alias_values_are_trimmed_and_deduplicated() {
+        let values = BTreeMap::from([
+            (
+                "OPENAI_API_KEYS".to_owned(),
+                "  shared , csv-only  ".to_owned(),
+            ),
+            ("OPENAI_API_KEY_1".to_owned(), " shared ".to_owned()),
+            ("OPENAI_API_KEY_2".to_owned(), " numbered-only ".to_owned()),
+            ("OPENAI_API_KEY".to_owned(), " csv-only ".to_owned()),
+        ]);
+
+        let keys = configured_openai_keys(&values).unwrap();
+        assert_eq!(
+            keys.iter()
+                .map(|key| key.expose_secret())
+                .collect::<Vec<_>>(),
+            vec!["shared", "csv-only"]
+        );
+    }
+
+    #[test]
+    fn nonempty_openai_csv_takes_precedence_over_numbered_and_legacy() {
+        let values = BTreeMap::from([
+            ("OPENAI_API_KEYS".to_owned(), " csv-key ".to_owned()),
+            ("OPENAI_API_KEY_1".to_owned(), "numbered-key".to_owned()),
+            ("OPENAI_API_KEY".to_owned(), "legacy-key".to_owned()),
+        ]);
+
+        let keys = configured_openai_keys(&values).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].expose_secret(), "csv-key");
+    }
+
+    #[test]
+    fn nonempty_openai_numbered_keys_take_precedence_over_legacy() {
+        let values = BTreeMap::from([
+            ("OPENAI_API_KEYS".to_owned(), " ,  ".to_owned()),
+            ("OPENAI_API_KEY_1".to_owned(), " numbered-key ".to_owned()),
+            ("OPENAI_API_KEY_2".to_owned(), " numbered-key ".to_owned()),
+            ("OPENAI_API_KEY".to_owned(), "legacy-key".to_owned()),
+        ]);
+
+        let keys = configured_openai_keys(&values).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].expose_secret(), "numbered-key");
     }
 }

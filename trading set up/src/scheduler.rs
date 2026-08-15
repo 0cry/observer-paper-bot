@@ -62,7 +62,7 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
         &config,
         storage_error.is_some(),
     );
-    let handle = DashboardHandle::new(initial);
+    let handle = DashboardHandle::new(initial).with_cron_store(log_store.clone());
     let runtime_logger = RuntimeEventLogger::new(handle.clone(), log_store.clone());
     if let Err(error) = runtime_logger.load_recent(200).await {
         storage_error = Some(error.to_string());
@@ -105,6 +105,28 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
         }
     });
     println!("Dashboard: http://{}", config.dashboard.bind);
+    if let Some(cron_store) = log_store.clone() {
+        let cron_logger = runtime_logger.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(15));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                timer.tick().await;
+                if let Err(error) =
+                    crate::cron_jobs::execute_due_jobs(&cron_store, Utc::now()).await
+                {
+                    cron_logger
+                        .record(
+                            "WARN",
+                            "cron",
+                            "RUNNER_DEGRADED",
+                            &format!("cron runner cycle failed: {error}"),
+                        )
+                        .await;
+                }
+            }
+        });
+    }
     runtime_logger
         .record(
             "INFO",
@@ -175,7 +197,7 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
             storage_degraded,
         )
         .await;
-        match discover_live_url(&http, &config.paths.yt_dlp_path, &channel_url).await {
+        match discover_live_url(&config.paths.yt_dlp_path, &channel_url).await {
             Ok(Some(stream_url)) => {
                 runtime_logger
                     .record(
@@ -286,32 +308,8 @@ fn is_trading_day(date: NaiveDate, holidays: &[NaiveDate]) -> bool {
     !matches!(date.weekday(), Weekday::Sat | Weekday::Sun) && !holidays.contains(&date)
 }
 
-async fn discover_live_url(
-    http: &Client,
-    yt_dlp: &Path,
-    channel_url: &str,
-) -> Result<Option<String>> {
+async fn discover_live_url(yt_dlp: &Path, channel_url: &str) -> Result<Option<String>> {
     let live_page = format!("{}/live", channel_url.trim_end_matches('/'));
-
-    if let Ok(Ok(response)) = timeout(
-        Duration::from_secs(15),
-        http.get(&live_page)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (compatible; ObserverPaperBot/1.0)",
-            )
-            .header("Cache-Control", "no-cache")
-            .send(),
-    )
-    .await
-        && response.status().is_success()
-        && let Ok(bytes) = response.bytes().await
-        && bytes.len() <= 4 * 1024 * 1024
-        && let Some(stream_url) = parse_live_page(&String::from_utf8_lossy(&bytes))
-    {
-        return Ok(Some(stream_url));
-    }
-
     let mut command = Command::new(yt_dlp);
     command
         .arg("--no-warnings")
@@ -328,7 +326,7 @@ async fn discover_live_url(
         .context("yt-dlp discovery timed out")?
         .context("could not execute yt-dlp discovery")?;
     if !output.status.success() {
-        bail!("yt-dlp discovery exited with status {}", output.status);
+        return Ok(None);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
@@ -338,26 +336,6 @@ async fn discover_live_url(
         }
     }
     Ok(None)
-}
-
-fn parse_live_page(html: &str) -> Option<String> {
-    let is_live = html.contains("itemprop=\"isLiveBroadcast\" content=\"True\"")
-        || html.contains("\"isLiveNow\":true")
-        || html.contains("\"liveStreamabilityRenderer\"");
-    if !is_live {
-        return None;
-    }
-
-    const CANONICAL: &str = "<link rel=\"canonical\" href=\"https://www.youtube.com/watch?v=";
-    let start = html.find(CANONICAL)? + CANONICAL.len();
-    let video_id = html.get(start..start + 11)?;
-    if !video_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        return None;
-    }
-    Some(format!("https://www.youtube.com/watch?v={video_id}"))
 }
 
 fn waiting_state(
@@ -387,28 +365,20 @@ fn waiting_state(
                 ..ComponentHealth::default()
             },
             transcription: stopped_component("Starts only after live discovery"),
-            gemini: stopped_component("Starts only after live discovery"),
+            analysis: stopped_component("Starts only after live discovery"),
             market_feed: stopped_component("Starts only after live discovery"),
             persistence: ComponentHealth {
                 status: "READY".to_owned(),
                 message: "Durable storage initializes with a live session".to_owned(),
                 ..ComponentHealth::default()
             },
-            api_keys: (1..=config.gemini.api_keys.len())
+            api_keys: (1..=config.elevenlabs.api_keys.len())
                 .map(|slot| ApiKeyHealthView {
-                    provider: "Gemini".to_owned(),
+                    provider: "ElevenLabs".to_owned(),
                     slot,
                     status: "READY".to_owned(),
                     ..ApiKeyHealthView::default()
                 })
-                .chain(
-                    (1..=config.elevenlabs.api_keys.len()).map(|slot| ApiKeyHealthView {
-                        provider: "ElevenLabs".to_owned(),
-                        slot,
-                        status: "READY".to_owned(),
-                        ..ApiKeyHealthView::default()
-                    }),
-                )
                 .collect(),
             ..HealthView::default()
         },
@@ -536,7 +506,7 @@ mod tests {
         AppConfig::from_values(
             "C:/project",
             [
-                ("GEMINI_API_KEY", "test-gemini-key"),
+                ("OPENAI_API_KEY", "test-analysis-key"),
                 ("ELEVENLABS_API_KEY", "test-elevenlabs-key"),
             ],
         )
@@ -622,19 +592,5 @@ mod tests {
             state.health.persistence.message,
             "durable paper state is unavailable; configured fallback wallets are displayed"
         );
-    }
-
-    #[test]
-    fn live_page_fallback_extracts_only_an_active_youtube_broadcast() {
-        let html = r#"<link rel="canonical" href="https://www.youtube.com/watch?v=jVNOcCob0m8">
-            <meta itemprop="isLiveBroadcast" content="True">"#;
-        assert_eq!(
-            parse_live_page(html),
-            Some("https://www.youtube.com/watch?v=jVNOcCob0m8".to_owned())
-        );
-
-        let ended = r#"<link rel="canonical" href="https://www.youtube.com/watch?v=jVNOcCob0m8">
-            <meta itemprop="isLiveBroadcast" content="False">"#;
-        assert_eq!(parse_live_page(ended), None);
     }
 }

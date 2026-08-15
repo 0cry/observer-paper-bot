@@ -31,6 +31,10 @@
           <span class="nav-icon" aria-hidden="true">≡</span>
           Trade history
         </button>
+        <button class="nav-item" type="button" data-view-target="cron">
+          <span class="nav-icon" aria-hidden="true">◷</span>
+          Cron jobs
+        </button>
       </nav>
 
       <section class="source-status" aria-labelledby="source-status-title">
@@ -40,7 +44,8 @@
           <li><span><i class="status-dot is-muted" id="feed-dot"></i>Market feed</span><b id="feed-label">Unknown</b></li>
           <li><span><i class="status-dot is-muted" id="stream-dot"></i>Video stream</span><b id="stream-label">Unknown</b></li>
           <li><span><i class="status-dot is-muted" id="stt-dot"></i>Transcription</span><b id="stt-label">Unknown</b></li>
-          <li><span><i class="status-dot is-muted" id="gemini-dot"></i>Gemini</span><b id="gemini-label">Unknown</b></li>
+          <li><span><i class="status-dot is-muted" id="luna-dot"></i>OpenAI / Luna</span><b id="luna-label">Unknown</b></li>
+          <li><span>Visual cadence</span><b id="visual-label">Waiting</b></li>
         </ul>
         <div class="api-key-health">
           <div class="sidebar-section-title">Credential slots</div>
@@ -48,6 +53,10 @@
         </div>
       </section>
 
+      <div class="sidebar-foot">
+        <span class="shield" aria-hidden="true">✓</span>
+        <span><strong>Paper trading only</strong><small>No broker order routing</small></span>
+      </div>
     </aside>
 
     <main class="main" id="main-content">
@@ -72,21 +81,22 @@
       </div>
 
       <section class="view is-active" id="live-view" data-view="live" aria-labelledby="live-heading">
-        <div class="section-heading live-heading">
-          <div>
-            <div class="heading-line">
-              <h2 id="live-heading">Session overview</h2>
-              <span class="market-pill" id="market-pill">Market —</span>
+        <div class="live-control-row">
+          <div class="section-heading live-heading">
+            <div>
+              <div class="heading-line">
+                <h2 id="live-heading">Live command center</h2>
+                <span class="market-pill" id="market-pill">Market —</span>
+              </div>
+              <p>Positions, session trajectory and Luna decisions in one view.</p>
             </div>
-            <p>Tick-level paper positions across both exit strategies.</p>
           </div>
+          <fieldset class="mode-filter" aria-label="Portfolio mode">
+            <legend>Portfolio mode</legend>
+            <label><input type="radio" name="mode" value="llm_exit" checked><span>Approach 1</span></label>
+            <label><input type="radio" name="mode" value="moving_sl"><span>Approach 2</span></label>
+          </fieldset>
         </div>
-
-        <fieldset class="mode-filter" aria-label="Portfolio mode">
-          <legend>Portfolio mode</legend>
-          <label><input type="radio" name="mode" value="llm_exit" checked><span>Approach 1</span></label>
-          <label><input type="radio" name="mode" value="moving_sl"><span>Approach 2</span></label>
-        </fieldset>
 
         <div class="kpi-grid" aria-live="polite">
           <article class="kpi-card accent-blue">
@@ -109,22 +119,28 @@
             <strong id="kpi-positions">—</strong>
             <span class="kpi-detail" id="kpi-positions-detail">0 pending orders</span>
           </article>
-          <article class="kpi-card accent-cyan">
-            <div class="kpi-label">Win rate</div>
-            <strong id="kpi-win-rate">—%</strong>
-            <span class="kpi-detail" id="kpi-win-detail">No closed trades</span>
-          </article>
-          <article class="kpi-card accent-red">
-            <div class="kpi-label">Max drawdown</div>
-            <strong id="kpi-drawdown">—%</strong>
-            <span class="kpi-detail" id="kpi-drawdown-detail">Session peak to trough</span>
-          </article>
         </div>
+        <div hidden><strong id="kpi-win-rate">—%</strong><span id="kpi-win-detail">No closed trades</span><strong id="kpi-drawdown">—%</strong><span id="kpi-drawdown-detail">Session peak to trough</span></div>
 
-        <div class="dashboard-grid chart-row">
+        <div class="dashboard-grid live-command-grid">
+          <article class="panel positions-panel">
+            <header class="panel-header">
+              <div><h3>Live positions</h3><p>Fresh LTP, active risk levels and per-account P&amp;L</p></div>
+              <div class="panel-tools"><span class="pulse-label"><i></i>Tick sync</span><span class="panel-count" id="position-count">0 open</span></div>
+            </header>
+            <div class="table-scroll">
+              <table class="data-table positions-table">
+                <thead>
+                  <tr><th>Contract / account</th><th>Mode</th><th class="numeric">Qty</th><th class="numeric">Entry</th><th class="numeric">LTP</th><th class="numeric">SL</th><th class="numeric">T1 / T2</th><th>Phase</th><th class="numeric">P&amp;L</th><th>Opened</th></tr>
+                </thead>
+                <tbody id="positions-body"></tbody>
+              </table>
+            </div>
+          </article>
+
           <article class="panel chart-panel">
             <header class="panel-header">
-              <div><h3>Session performance</h3><p>Equity and cumulative P&amp;L</p></div>
+              <div><h3>Session curve</h3><p>Equity and cumulative P&amp;L</p></div>
               <div class="chart-legend" aria-label="Chart legend"><span><i class="line-equity"></i>Equity</span><span><i class="line-pnl"></i>P&amp;L</span></div>
             </header>
             <div class="chart-wrap">
@@ -133,7 +149,9 @@
             </div>
             <p class="sr-only" id="chart-summary">No session performance data is available.</p>
           </article>
+        </div>
 
+        <div class="dashboard-grid live-secondary-grid">
           <article class="panel accounts-panel">
             <header class="panel-header">
               <div><h3>Account allocation</h3><p>Cash, margin and mark-to-market</p></div>
@@ -146,72 +164,85 @@
               </table>
             </div>
           </article>
-        </div>
-
-        <article class="panel positions-panel">
-          <header class="panel-header">
-            <div><h3>Live positions</h3><p>Fresh LTP, active risk levels and per-account P&amp;L</p></div>
-            <div class="panel-tools"><span class="pulse-label"><i></i>Tick sync</span><span class="panel-count" id="position-count">0 open</span></div>
-          </header>
-          <div class="table-scroll">
-            <table class="data-table positions-table">
-              <thead>
-                <tr><th>Contract / account</th><th>Mode</th><th class="numeric">Qty</th><th class="numeric">Entry</th><th class="numeric">LTP</th><th class="numeric">SL</th><th class="numeric">T1 / T2</th><th>Phase</th><th class="numeric">P&amp;L</th><th>Opened</th></tr>
-              </thead>
-              <tbody id="positions-body"></tbody>
-            </table>
-          </div>
-        </article>
-
-        <div class="dashboard-grid lower-row">
-          <article class="panel">
-            <header class="panel-header">
-              <div><h3>Pending entries</h3><p>Waiting for buffered limit conditions</p></div>
-              <span class="panel-count" id="pending-count">0 pending</span>
-            </header>
-            <div class="table-scroll compact-table">
-              <table>
-                <thead><tr><th>Contract</th><th class="numeric">Entry cap</th><th class="numeric">LTP</th><th>Accounts</th><th>Age</th></tr></thead>
-                <tbody id="pending-body"></tbody>
-              </table>
-            </div>
-          </article>
 
           <article class="panel signals-panel">
             <header class="panel-header">
-              <div><h3>Gemini signal stream</h3><p>Latest extracted trading decisions</p></div>
+              <div><h3>OpenAI / Luna signal stream</h3><p>Latest extracted trading decisions</p></div>
               <span class="panel-count" id="signal-count">0 signals</span>
             </header>
             <ol class="signal-timeline" id="signals-list"></ol>
           </article>
         </div>
+
+        <article class="panel pending-panel">
+          <header class="panel-header">
+            <div><h3>Pending entries</h3><p>Waiting for buffered limit conditions</p></div>
+            <span class="panel-count" id="pending-count">0 pending</span>
+          </header>
+          <div class="table-scroll compact-table">
+            <table>
+              <thead><tr><th>Contract</th><th class="numeric">Entry cap</th><th class="numeric">LTP</th><th>Accounts</th><th>Age</th></tr></thead>
+              <tbody id="pending-body"></tbody>
+            </table>
+          </div>
+        </article>
       </section>
 
       <section class="view" id="history-view" data-view="history" aria-labelledby="history-heading" hidden>
-        <div class="section-heading history-heading">
-          <div><h2 id="history-heading">Trade history</h2><p>Audit every simulated fill, exit and strategy outcome.</p></div>
-          <button class="secondary-button" type="button" id="export-button">↓ Export filtered CSV</button>
+        <div class="history-title-row">
+          <h2 id="history-heading">Performance curve</h2>
+          <div class="history-title-actions">
+            <span class="history-result-count" id="history-result-count" hidden><strong id="history-total">0</strong> trades</span>
+            <button class="secondary-button" type="button" id="export-button">Export CSV</button>
+          </div>
         </div>
 
-        <form class="history-filters panel" id="history-filters" role="search">
-          <label class="search-field"><span>Search</span><input type="search" name="q" id="history-search" placeholder="Contract, account or setup ID" autocomplete="off"></label>
-          <label><span>Status</span><select name="status" id="history-status"><option value="">All statuses</option><option value="won">Won</option><option value="lost">Lost</option><option value="breakeven">Breakeven</option><option value="open">Open</option><option value="cancelled">Cancelled</option></select></label>
-          <label><span>Mode</span><select name="mode" id="history-mode"><option value="">All modes</option><option value="llm_exit">Approach 1</option><option value="moving_sl">Approach 2</option></select></label>
-          <label><span>Account</span><select name="account" id="history-account"><option value="">All accounts</option></select></label>
-          <label><span>Underlying</span><select name="underlying" id="history-underlying"><option value="">All underlyings</option><option value="NIFTY">NIFTY</option><option value="SENSEX">SENSEX</option></select></label>
-          <label><span>From</span><input type="date" name="from" id="history-from"></label>
-          <label><span>To</span><input type="date" name="to" id="history-to"></label>
-          <button class="quiet-button" type="reset" id="clear-filters">Clear filters</button>
+        <div class="history-analytics-panel">
+          <span class="panel-count" id="history-chart-range" hidden>All filtered trades</span>
+          <div class="history-chart-wrap">
+            <canvas id="history-performance-chart" role="img" aria-label="Cumulative realized profit and loss for filtered trades"></canvas>
+            <div class="history-chart-empty is-visible" id="history-chart-empty">Analytics appear when closed trades are available.</div>
+            <div class="history-chart-tooltip" id="history-chart-tooltip" hidden></div>
+          </div>
+          <p class="sr-only" id="history-chart-summary">No filtered trade analytics are available.</p>
+        </div>
+
+        <div class="history-metrics" aria-live="polite">
+          <article class="history-metric-card accent-green">
+            <span>Net P&amp;L</span>
+            <strong id="history-net">₹0.00</strong>
+            <small id="history-net-detail">Filtered closed trades</small>
+          </article>
+          <article class="history-metric-card accent-red">
+            <span>Max DD</span>
+            <strong id="history-drawdown">₹0.00</strong>
+            <small>Peak-to-trough realized P&amp;L</small>
+          </article>
+          <article class="history-metric-card accent-blue">
+            <span>Avg trade</span>
+            <strong id="history-average">₹0.00</strong>
+            <small id="history-average-detail">No closed trades</small>
+          </article>
+          <article class="history-metric-card accent-violet">
+            <span>Win rate</span>
+            <strong id="history-win-rate">0.0%</strong>
+            <small id="history-win-detail">0 wins from 0 trades</small>
+          </article>
+        </div>
+
+        <form class="history-filters compact-history-filters" id="history-filters" role="search">
+          <label class="compact-filter"><span>Search</span><input type="search" name="q" id="history-search" placeholder="Search trades" autocomplete="off" aria-label="Search trades"></label>
+          <label class="compact-filter"><span>Status</span><select name="status" id="history-status" aria-label="Status"><option value="">Status</option><option value="won">Won</option><option value="lost">Lost</option><option value="breakeven">Breakeven</option><option value="open">Open</option><option value="cancelled">Cancelled</option></select></label>
+          <label class="compact-filter"><span>Mode</span><select name="mode" id="history-mode" aria-label="Mode"><option value="">Mode</option><option value="llm_exit">Approach 1</option><option value="moving_sl">Approach 2</option></select></label>
+          <label class="compact-filter"><span>Date</span><input type="date" name="from" id="history-from" aria-label="Date"></label>
+          <label hidden><span>Account</span><select name="account" id="history-account" hidden><option value="">All accounts</option></select></label>
+          <label hidden><span>Underlying</span><select name="underlying" id="history-underlying" hidden><option value="">All underlyings</option><option value="NIFTY">NIFTY</option><option value="SENSEX">SENSEX</option></select></label>
+          <label hidden><span>To</span><input type="date" name="to" id="history-to" hidden></label>
+          <button class="quiet-button" type="reset" id="clear-filters" hidden>Clear filters</button>
         </form>
 
-        <div class="history-stats" aria-live="polite">
-          <span><strong id="history-total">0</strong> trades</span>
-          <span>Net P&amp;L <strong id="history-net">₹0.00</strong></span>
-          <span>Wins / losses <strong id="history-record">0 / 0</strong></span>
-          <span>Avg. trade <strong id="history-average">₹0.00</strong></span>
-        </div>
-
-        <article class="panel history-panel">
+        <article class="history-panel compact-history-ledger">
+          <span class="panel-count" id="history-ledger-count" hidden>0 results</span>
           <div class="table-scroll">
             <table class="data-table history-table">
               <thead>
@@ -235,12 +266,65 @@
           <footer class="pagination">
             <span id="page-summary">No trades</span>
             <div>
-              <label>Rows <select id="page-size" aria-label="Rows per page"><option>10</option><option selected>25</option><option>50</option><option>100</option></select></label>
+              <input type="hidden" id="page-size" value="5">
               <button type="button" class="icon-button" id="previous-page" aria-label="Previous page">←</button>
               <span id="page-number">Page 1 of 1</span>
               <button type="button" class="icon-button" id="next-page" aria-label="Next page">→</button>
             </div>
           </footer>
+        </article>
+      </section>
+
+      <section class="view" id="cron-view" data-view="cron" aria-labelledby="cron-heading" hidden>
+        <div class="section-heading history-heading">
+          <div><h2 id="cron-heading">Cron jobs</h2><p>RAM-only Luna keys and ordinary public HTTPS jobs, evaluated in IST.</p></div>
+        </div>
+
+        <article class="panel cron-key-panel">
+          <header class="panel-header"><div><h3>Runtime OpenAI keys</h3><p>Up to three keys stay only in this process RAM. They can be added or cleared, never viewed.</p></div><span class="panel-count" id="runtime-key-state">Keys required</span></header>
+          <div class="runtime-slots" aria-label="Runtime key slots">
+            <div class="runtime-slot"><i></i><span>Slot 1</span><b id="runtime-slot-1">Empty</b></div>
+            <div class="runtime-slot"><i></i><span>Slot 2</span><b id="runtime-slot-2">Empty</b></div>
+            <div class="runtime-slot"><i></i><span>Slot 3</span><b id="runtime-slot-3">Empty</b></div>
+          </div>
+          <form class="cron-key-form" id="runtime-key-form">
+            <label><span class="sr-only">Runtime OpenAI keys</span><textarea id="runtime-key-input" rows="3" maxlength="1024" placeholder="Paste one key per line. Values are never displayed after submit." autocomplete="off" spellcheck="false" required></textarea></label>
+            <div class="cron-key-actions"><button class="quiet-button" type="button" id="runtime-key-clear">Clear all slots</button><button class="secondary-button" type="submit">Load into RAM</button></div>
+          </form>
+          <div class="history-stats" id="runtime-key-health" aria-live="polite">No runtime keys loaded.</div>
+        </article>
+
+        <div class="cron-health-grid" aria-label="Cron health summary">
+          <article class="cron-health-card"><span>Active jobs</span><strong id="cron-active-count">0</strong></article>
+          <article class="cron-health-card"><span>Healthy</span><strong class="pnl-positive" id="cron-healthy-count">0</strong></article>
+          <article class="cron-health-card"><span>Failed</span><strong class="pnl-negative" id="cron-failed-count">0</strong></article>
+          <article class="cron-health-card"><span>Next run</span><strong id="cron-next-run">—</strong></article>
+        </div>
+
+        <article class="panel cron-builder-panel">
+          <header class="panel-header"><div><h3>New HTTPS cron job</h3><p>Build a five-field IST schedule using a common preset or custom expression.</p></div><span class="panel-count">IST</span></header>
+          <form class="cron-builder-form" id="cron-job-form">
+            <label><span>Job label</span><input id="cron-label" maxlength="80" placeholder="Wake dashboard" required></label>
+            <div class="cron-schedule-builder">
+              <span class="cron-field-label">Run schedule</span>
+              <div class="cron-presets" aria-label="Schedule presets">
+                <button type="button" data-cron-preset="every-5">Every 5 min</button>
+                <button type="button" data-cron-preset="every-10">Every 10 min</button>
+                <button type="button" data-cron-preset="hourly">Hourly</button>
+                <button type="button" data-cron-preset="custom">Custom</button>
+              </div>
+              <input id="cron-expression" aria-label="Five-field cron expression" placeholder="*/10 9-16 * * 1-5" required>
+              <small id="cron-expression-help">Five-field cron expression evaluated in IST.</small>
+            </div>
+            <label><span>Target HTTPS URL</span><input id="cron-target-url" type="url" maxlength="2048" placeholder="https://your-service.onrender.com/health" required></label>
+            <button class="secondary-button cron-create-button" type="submit">Create scheduled job</button>
+            <p class="cron-safety-copy"><i></i>Bounded GET only. Response bodies are discarded.</p>
+          </form>
+        </article>
+
+        <article class="panel history-panel cron-jobs-panel">
+          <header class="panel-header"><div><h3>Scheduled jobs</h3><p>Recent status is metadata only; response bodies are discarded.</p></div></header>
+          <div class="table-scroll"><table class="data-table"><thead><tr><th>Job</th><th>Schedule</th><th>Target</th><th>Next run</th><th>Last result</th><th>Controls</th></tr></thead><tbody id="cron-jobs-body"></tbody></table></div>
         </article>
       </section>
     </main>

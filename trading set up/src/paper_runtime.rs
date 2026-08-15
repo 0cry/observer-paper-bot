@@ -25,9 +25,15 @@ use tokio::{
 
 use crate::{
     InstrumentRow, TokenManager,
+    analysis::{
+        self, ActionKind, AnalysisClient, AnalysisClientConfig, AnalysisInput, ClipWindow,
+        ExitMode, OptionType as AnalysisOptionType, PriceSnapshot, TradeAction, TradeDirection,
+        Underlying as AnalysisUnderlying, ValidatedAnalysis, WatchedOptionSnapshot,
+    },
+    blocker::{DispatchEvent, Dispatcher, InputClip, RetainedClip},
     capture::{
-        CaptureConfig, CaptureEvent, CaptureSession, MediaSegment, MediaWindow, SEGMENT_SECONDS,
-        WINDOW_SECONDS, WINDOW_SEGMENTS,
+        CaptureConfig, CaptureEvent, CaptureSession, MediaSegment, SEGMENT_SECONDS,
+        extract_latest_selected_jpeg,
     },
     config::AppConfig,
     dashboard::{
@@ -36,11 +42,6 @@ use crate::{
         SessionView, SignalView,
     },
     fetch_instruments,
-    gemini::{
-        self, ActionKind, AnalysisInput, ClipWindow, ExitMode, GeminiClient, GeminiClientConfig,
-        OptionType as GeminiOptionType, PriceSnapshot, TradeAction, TradeDirection,
-        Underlying as GeminiUnderlying, ValidatedAnalysis, WatchedOptionSnapshot,
-    },
     market_feed::{
         FeedConnectionState, LatestTicks, MarketFeedConfig, MarketFeedHandle, ResolvedInstrument,
         SubscriptionLease, SubscriptionReason, Tick, TickSource, spawn_market_feed,
@@ -55,6 +56,7 @@ use crate::{
     },
     parse_instrument_expiry,
     persistence::{JsonlEventWriter, SyncPolicy, atomic_write_json_snapshot, load_json_snapshot},
+    recovery_buffer::{RecoveryBuffer, RecoveryImage},
     runtime_logs::RuntimeEventLogger,
     stt::{ElevenLabsSttClient, SegmentInput, SttOptions, TranscriptChunk, TranscriptStatus},
     trailing::{TrailLevels, TrailPhase, TrailState, Underlying as TrailUnderlying},
@@ -74,7 +76,7 @@ const MAX_EXECUTABLE_SIGNAL_AGE_MS: i64 = 45_000;
 
 #[derive(Clone)]
 struct RoutedContract {
-    gemini: gemini::OptionContract,
+    analysis: analysis::OptionContract,
     paper: PaperContract,
     instrument: ResolvedInstrument,
 }
@@ -93,13 +95,130 @@ struct SttCompleted {
     latency_ms: u64,
 }
 
-struct GeminiCompleted {
-    window: MediaWindow,
+/// STT requests complete concurrently, but downstream blocker decisions must
+/// see source segments in capture order. The first capture sequence establishes
+/// the contiguous drain point; failed transcripts are buffered and drained like
+/// successful ones so they cannot leave a permanent sequence gap.
+#[derive(Debug)]
+struct OrderedSttCompletionBuffer<T> {
+    next_sequence: Option<u64>,
+    buffered: BTreeMap<u64, T>,
+}
+
+impl<T> Default for OrderedSttCompletionBuffer<T> {
+    fn default() -> Self {
+        Self {
+            next_sequence: None,
+            buffered: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T> OrderedSttCompletionBuffer<T> {
+    fn begin_at(&mut self, sequence: u64) {
+        if self.next_sequence.is_none() {
+            self.next_sequence = Some(sequence);
+        }
+    }
+
+    fn insert(&mut self, sequence: u64, completed: T) -> Vec<T> {
+        let Some(next_sequence) = self.next_sequence else {
+            self.next_sequence = Some(sequence.saturating_add(1));
+            return vec![completed];
+        };
+        if sequence < next_sequence || self.buffered.contains_key(&sequence) {
+            return Vec::new();
+        }
+        self.buffered.insert(sequence, completed);
+
+        let mut ordered = Vec::new();
+        let mut next = next_sequence;
+        while let Some(completed) = self.buffered.remove(&next) {
+            ordered.push(completed);
+            next = next.saturating_add(1);
+        }
+        self.next_sequence = Some(next);
+        ordered
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.buffered.is_empty()
+    }
+}
+
+struct AnalysisCompleted {
+    dispatch: ReadyDispatch,
     input: AnalysisInput,
     transcript_excerpt: String,
-    observed_candidate_ids: HashSet<String>,
     latency_ms: u64,
+    visual_sent: bool,
+    visual_note: Option<String>,
+    recovery_image: Option<RecoveryImage>,
     result: std::result::Result<ValidatedAnalysis, String>,
+}
+
+/// Sparse visual input is deliberately tied to durable context commits rather
+/// than requests. A failed model call or failed commit never advances cadence.
+#[derive(Debug, Default, Clone)]
+struct VisualCadence {
+    commits_since_visual: u8,
+    last_visual_at: Option<DateTime<Utc>>,
+}
+
+impl VisualCadence {
+    fn visual_due(&self) -> bool {
+        self.commits_since_visual >= 4
+    }
+
+    fn record_committed(&mut self, visual_sent: bool, at: DateTime<Utc>) {
+        if visual_sent {
+            self.commits_since_visual = 0;
+            self.last_visual_at = Some(at);
+        } else if !self.visual_due() {
+            self.commits_since_visual = self.commits_since_visual.saturating_add(1);
+        }
+    }
+
+    fn status(&self) -> String {
+        if self.visual_due() {
+            "frame due on next eligible analysis".to_owned()
+        } else {
+            format!(
+                "frame after {} more committed analysis call(s)",
+                4 - self.commits_since_visual
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReadyDispatch {
+    sequence: u64,
+    clips: Vec<RetainedClip>,
+    segments: Vec<MediaSegment>,
+}
+
+impl ReadyDispatch {
+    fn source_sequences(&self) -> impl Iterator<Item = u64> + '_ {
+        self.segments.iter().map(|segment| segment.sequence)
+    }
+
+    fn started_at(&self) -> DateTime<Utc> {
+        self.segments
+            .iter()
+            .map(|segment| segment.started_at_utc)
+            .min()
+            .expect("ready dispatch always owns a source segment")
+    }
+
+    fn ended_at(&self) -> DateTime<Utc> {
+        self.segments
+            .iter()
+            .map(|segment| segment.ended_at_utc)
+            .max()
+            .expect("ready dispatch always owns a source segment")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -110,7 +229,31 @@ struct StreamContextEnvelope {
     updated_at: DateTime<Utc>,
     source_window_sequence: u64,
     source_clip_ended_at: DateTime<Utc>,
-    rolling_context: gemini::RollingContext,
+    rolling_context: analysis::RollingContext,
+}
+
+impl StreamContextEnvelope {
+    fn for_analysis(
+        stream_url: String,
+        source_window_sequence: u64,
+        source_clip_ended_at: DateTime<Utc>,
+        rolling_context: analysis::RollingContext,
+        observed_at: DateTime<Utc>,
+    ) -> Self {
+        let trading_date_ist = ist_trading_date(source_clip_ended_at);
+        Self {
+            schema_version: STREAM_CONTEXT_SCHEMA_VERSION,
+            stream_url,
+            trading_date_ist,
+            // The segment clock can legitimately be slightly ahead of the
+            // sampled wall clock at live edge. A committed envelope must not
+            // claim to have been updated before its own source evidence ends.
+            updated_at: observed_at.max(source_clip_ended_at),
+            source_window_sequence,
+            source_clip_ended_at,
+            rolling_context,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,29 +261,90 @@ struct DurablePaperState {
     broker: PaperBroker,
     stream_url: String,
     trading_date_ist: String,
-    rolling_context: Option<gemini::RollingContext>,
+    rolling_context: Option<analysis::RollingContext>,
     history: Vec<HistoryTrade>,
     #[serde(default)]
     equity_curve: Vec<EquityPoint>,
     updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableStateSource {
+    Local,
+    Neon,
+}
+
+/// Choose by the checkpoint timestamp. Equal/invalid timestamps resolve to
+/// local so a locally durable broker order is never discarded merely because
+/// a remote replica has the same coarse timestamp.
+fn select_newest_durable_state<T>(
+    local: Option<T>,
+    neon: Option<T>,
+    updated_at: impl Fn(&T) -> DateTime<Utc>,
+) -> Option<(DurableStateSource, T)> {
+    match (local, neon) {
+        (Some(local), Some(neon)) => {
+            if updated_at(&neon) > updated_at(&local) {
+                Some((DurableStateSource::Neon, neon))
+            } else {
+                Some((DurableStateSource::Local, local))
+            }
+        }
+        (Some(local), None) => Some((DurableStateSource::Local, local)),
+        (None, Some(neon)) => Some((DurableStateSource::Neon, neon)),
+        (None, None) => None,
+    }
+}
+
+fn local_broker_checkpoint_time(path: &Path) -> DateTime<Utc> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(DateTime::<Utc>::from)
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch is valid"))
+}
+
+fn load_local_durable_state(
+    broker_path: &Path,
+    history_path: &Path,
+    context_path: &Path,
+    stream_url: &str,
+    trading_date_ist: &str,
+) -> Result<Option<DurablePaperState>> {
+    let Some(broker) = load_json_snapshot::<PaperBroker>(broker_path)? else {
+        return Ok(None);
+    };
+    // Context is optional and cannot elevate a broker/order claim. Any
+    // invalid/orphan context is ignored until it can be reconciled below.
+    let rolling_context =
+        load_stream_context(context_path, stream_url, trading_date_ist).unwrap_or(None);
+    Ok(Some(DurablePaperState {
+        broker,
+        stream_url: stream_url.to_owned(),
+        trading_date_ist: trading_date_ist.to_owned(),
+        rolling_context,
+        history: load_json_snapshot::<Vec<HistoryTrade>>(history_path)?.unwrap_or_default(),
+        equity_curve: Vec::new(),
+        updated_at: local_broker_checkpoint_time(broker_path),
+    }))
+}
+
 struct ContextCommitCompleted {
-    completed: GeminiCompleted,
+    completed: AnalysisCompleted,
     analysis: ValidatedAnalysis,
     envelope: StreamContextEnvelope,
     result: std::result::Result<(), String>,
 }
 
-/// A Gemini call remains active until its validated rolling context has been
+/// A Analysis call remains active until its validated rolling context has been
 /// durably committed. This makes the context supplied to call N+1 exactly the
 /// context returned by call N, while the rest of the runtime remains async.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct GeminiDispatchState {
+struct AnalysisDispatchState {
     active_sequence: Option<u64>,
 }
 
-impl GeminiDispatchState {
+impl AnalysisDispatchState {
     fn try_begin(&mut self, sequence: u64) -> bool {
         if self.active_sequence.is_some() {
             return false;
@@ -339,22 +543,29 @@ async fn run_internal(
         format!("Scribe v2 ready with {credential_count} credential slot(s)"),
     );
 
-    let gemini_config = GeminiClientConfig {
-        model: config.gemini.model.clone(),
-        confidence_threshold: config.trading.minimum_confidence_pct.round() as u8,
-        ..GeminiClientConfig::default()
+    let analysis_config = AnalysisClientConfig {
+        model: config.openai.model.clone(),
+        ..AnalysisClientConfig::default()
     };
-    let gemini_client = Arc::new(GeminiClient::from_keys_config(
-        config.gemini.api_keys.iter().map(|key| key.expose_secret()),
-        gemini_config,
+    let analysis_client = Arc::new(AnalysisClient::from_runtime_vault(
+        dashboard_handle.openai_vault(),
+        analysis_config,
     )?);
-    let gemini_credential_count = gemini_client.credential_count().await;
-    health.gemini = component(
-        "READY",
-        format!(
-            "{} ready with {gemini_credential_count} credential slot(s)",
-            config.gemini.model
-        ),
+    let analysis_credential_count = analysis_client.credential_count().await;
+    health.analysis = component(
+        if analysis_credential_count == 0 {
+            "KEYS_REQUIRED"
+        } else {
+            "READY"
+        },
+        if analysis_credential_count == 0 {
+            "add an OpenAI key in the dashboard".to_owned()
+        } else {
+            format!(
+                "{} ready with {analysis_credential_count} credential slot(s)",
+                config.openai.model
+            )
+        },
     );
 
     let broker_config = paper_broker_config(&config)?;
@@ -377,18 +588,27 @@ async fn run_internal(
         runtime_logger = RuntimeEventLogger::new(dashboard_handle.clone(), neon_store.clone());
         let _ = runtime_logger.load_recent(200).await;
     }
-    let remote_state = match neon_store.as_ref() {
+    let broker_state_path = paper_root.join("state_latest.json");
+    let stream_context_path = paper_root.join("stream_context.json");
+    let history_path = paper_root.join("trade_history.json");
+    let neon_state = match neon_store.as_ref() {
         Some(store) => store
             .load_runtime_state::<DurablePaperState>("paper-primary")
             .await
             .context("could not restore durable Neon paper state")?,
         None => None,
     };
-    let broker_state_path = paper_root.join("state_latest.json");
-    let persisted_broker = remote_state
-        .as_ref()
-        .map(|state| state.broker.clone())
-        .or(load_json_snapshot::<PaperBroker>(&broker_state_path)?);
+    let local_state = load_local_durable_state(
+        &broker_state_path,
+        &history_path,
+        &stream_context_path,
+        &stream_url,
+        &trading_date_ist,
+    )?;
+    let selected_state =
+        select_newest_durable_state(local_state, neon_state, |state| state.updated_at);
+    let remote_state = selected_state.as_ref().map(|(_, state)| state);
+    let persisted_broker = remote_state.map(|state| state.broker.clone());
     let restored_broker = persisted_broker.is_some();
     let mut broker = match persisted_broker {
         Some(persisted) => PaperBroker::restore_from_persisted(
@@ -399,7 +619,6 @@ async fn run_internal(
         .context("persisted paper broker state is incompatible with current configuration")?,
         None => PaperBroker::with_accounts(broker_config, account_specs)?,
     };
-    let stream_context_path = paper_root.join("stream_context.json");
     let remote_context = remote_state.as_ref().and_then(|state| {
         (state.stream_url == stream_url && state.trading_date_ist == trading_date_ist)
             .then(|| state.rolling_context.clone())
@@ -444,6 +663,9 @@ async fn run_internal(
             }
         }
     };
+    if let Some(context) = rolling_context.as_mut() {
+        reconcile_restored_context_with_broker(context, &broker);
+    }
     broker
         .start_trading_day_ist(&trading_date_ist, now.timestamp_millis())
         .context("could not initialize the current IST paper-trading date")?;
@@ -458,7 +680,6 @@ async fn run_internal(
         },
     )?;
 
-    let history_path = paper_root.join("trade_history.json");
     let mut historical_trades = remote_state
         .as_ref()
         .map(|state| state.history.clone())
@@ -496,7 +717,10 @@ async fn run_internal(
         .context("could not start current-live-edge capture")?;
     let capture_controller = capture.controller();
     session_view.status = "RUNNING".to_owned();
-    health.stream_capture = component("STARTING", "waiting for the first closed 4-second segment");
+    health.stream_capture = component(
+        "STARTING",
+        "waiting for the first closed 3-second source segment",
+    );
     health.persistence = component(
         "HEALTHY",
         if neon_store.is_some() {
@@ -513,12 +737,17 @@ async fn run_internal(
     )?;
 
     let (stt_sender, mut stt_receiver) = mpsc::channel::<SttCompleted>(32);
-    let (gemini_sender, mut gemini_receiver) = mpsc::channel::<GeminiCompleted>(8);
+    let (analysis_sender, mut analysis_receiver) = mpsc::channel::<AnalysisCompleted>(8);
     let (context_commit_sender, mut context_commit_receiver) =
         mpsc::channel::<ContextCommitCompleted>(1);
-    let mut transcripts = BTreeMap::<u64, TranscriptChunk>::new();
-    let mut pending_windows = BTreeMap::<u64, MediaWindow>::new();
-    let mut gemini_dispatch = GeminiDispatchState::default();
+    let mut source_segments = BTreeMap::<u64, MediaSegment>::new();
+    let mut recovery_buffer = RecoveryBuffer::default();
+    let mut stt_completion_buffer = OrderedSttCompletionBuffer::default();
+    let mut blocker_dispatcher = Dispatcher::default();
+    let mut pending_dispatch = Option::<ReadyDispatch>::None;
+    let mut analysis_dispatch = AnalysisDispatchState::default();
+    let mut visual_cadence = VisualCadence::default();
+    session_view.visual_status = Some(visual_cadence.status());
     let mut candidate_watches = Vec::<CandidateWatch>::new();
     let mut persistent_leases = HashMap::<(String, SubscriptionReason), SubscriptionLease>::new();
     let mut known_routes = routes_from_broker(&broker)?;
@@ -548,6 +777,8 @@ async fn run_internal(
     neon_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut equity_timer = interval(Duration::from_secs(EQUITY_SAMPLE_SECONDS));
     equity_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut blocker_timer = interval(Duration::from_millis(250));
+    blocker_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let deadline = duration_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let deadline_wait = async {
         match deadline {
@@ -623,16 +854,10 @@ async fn run_internal(
             capture_event = capture.next_event(), if capture_active => {
                 match capture_event {
                     Some(CaptureEvent::SegmentReady(segment)) => {
-                        health.stream_capture = component("HEALTHY", "receiving exact 4-second live-edge segments");
-                        session_view.transcript_segments_ready = transcripts.len();
+                        health.stream_capture = component("HEALTHY", "receiving exact 3-second live-edge source segments");
+                        session_view.transcript_segments_ready = source_segments.len();
+                        stt_completion_buffer.begin_at(segment.sequence);
                         spawn_stt_job(stt_client.clone(), stt_sender.clone(), segment);
-                    }
-                    Some(CaptureEvent::WindowReady(window)) => {
-                        session_view.clip_window_start = Some(window.started_at_utc.to_rfc3339());
-                        session_view.clip_window_end = Some(window.ended_at_utc.to_rfc3339());
-                        session_view.clip_age_ms = Some(age_ms(window.ended_at_utc, Utc::now()));
-                        pending_windows.insert(window.sequence, window);
-                        dashboard_dirty = true;
                     }
                     Some(CaptureEvent::Fault { message, .. }) => {
                         health.stream_capture = component("DEGRADED", message.clone());
@@ -651,6 +876,18 @@ async fn run_internal(
                         capture_active = false;
                         health.stream_capture = component("STOPPED", format!("stream capture stopped: {reason:?}"));
                         session_view.status = "STREAM_ENDED_MARKET_MANAGEMENT_ACTIVE".to_owned();
+                        let cancelled = broker.cancel_all_pending_entries(
+                            Utc::now().timestamp_millis(),
+                            "pending entry cancelled because the stream ended",
+                        );
+                        if !cancelled.is_empty() {
+                            append_pipeline_audit(
+                                &mut audit_writer,
+                                "paper",
+                                "pending_entries_cancelled",
+                                "stream ended before pending entry filled",
+                            )?;
+                        }
                         append_pipeline_audit(&mut audit_writer, "capture", "stopped", &format!("{reason:?}"))?;
                         runtime_logger
                             .record(
@@ -676,22 +913,12 @@ async fn run_internal(
                         dashboard_dirty = true;
                     }
                 }
-                launch_next_ready_window(
-                    &mut pending_windows,
-                    &mut transcripts,
-                    &mut candidate_watches,
-                    &known_routes,
-                    &broker,
-                    &latest_ticks,
-                    gemini_client.clone(),
-                    gemini_sender.clone(),
-                    &mut health,
-                    &mut session_view,
-                    rolling_context.as_ref(),
-                    &mut gemini_dispatch,
-                );
             }
             Some(completed) = stt_receiver.recv() => {
+                let ordered_completions = stt_completion_buffer
+                    .insert(completed.segment.sequence, completed);
+                let mut ready_dispatches = Vec::new();
+                for completed in ordered_completions {
                 let complete = completed.transcript.status == TranscriptStatus::Complete;
                 session_view.transcription_latency_ms = Some(completed.latency_ms);
                 health.transcription = if complete {
@@ -712,108 +939,157 @@ async fn run_internal(
                         )
                         .await;
                 }
-                transcripts.insert(completed.segment.sequence, completed.transcript);
-                if let Err(error) = capture_controller
-                    .acknowledge_segment(completed.segment.id)
-                    .await
-                {
-                    capture_active = false;
-                    health.stream_capture = component(
-                        "STOPPED",
-                        format!("capture stopped before segment acknowledgement: {error:#}"),
-                    );
-                    append_pipeline_audit(
-                        &mut audit_writer,
-                        "capture",
-                        "acknowledgement_skipped",
-                        "capture worker stopped before a completed STT acknowledgement",
-                    )?;
-                    runtime_logger
-                        .record(
-                            "ERROR",
-                            "capture",
-                            "SEGMENT_ACK_FAILED",
-                            "capture segment acknowledgement failed after transcription",
-                        )
-                        .await;
+                let sequence = completed.segment.sequence;
+                let segment = completed.segment;
+                recovery_buffer.push_transcript(completed.transcript.clone());
+                let text = complete.then_some(completed.transcript.text).unwrap_or_default();
+                source_segments.insert(sequence, segment.clone());
+                let events = blocker_dispatcher.ingest(InputClip::new(
+                    sequence,
+                    segment.started_at_utc.timestamp_millis(),
+                    segment.duration_ms,
+                    text,
+                ));
+                for event in events {
+                    match event {
+                        DispatchEvent::Blocked { audit, .. } | DispatchEvent::ExpiredNormal { audit } => {
+                            acknowledge_terminal_source_segment(
+                                &capture_controller,
+                                &mut source_segments,
+                                audit.sequence,
+                            ).await?;
+                        }
+                        DispatchEvent::FullSet { clips } => {
+                            if let Some(ready) = take_ready_dispatch(clips, &mut source_segments) {
+                                ready_dispatches.push(ready);
+                            }
+                        }
+                        DispatchEvent::MustSolo { clip } => {
+                            if let Some(ready) = take_ready_dispatch(vec![clip], &mut source_segments) {
+                                ready_dispatches.push(ready);
+                            }
+                        }
+                    }
                 }
-                session_view.transcript_segments_ready = transcripts.len();
-                launch_next_ready_window(
-                    &mut pending_windows,
-                    &mut transcripts,
+                }
+                for ready in ready_dispatches {
+                    enqueue_ready_dispatch(
+                        &capture_controller,
+                        &mut audit_writer,
+                        &mut pending_dispatch,
+                        ready,
+                    )
+                    .await?;
+                }
+                session_view.transcript_segments_ready = source_segments.len();
+                launch_next_ready_dispatch(
+                    &mut pending_dispatch,
                     &mut candidate_watches,
                     &known_routes,
                     &broker,
                     &latest_ticks,
-                    gemini_client.clone(),
-                    gemini_sender.clone(),
+                    analysis_client.clone(),
+                    analysis_sender.clone(),
                     &mut health,
                     &mut session_view,
                     rolling_context.as_ref(),
-                    &mut gemini_dispatch,
+                    &mut analysis_dispatch,
+                    &config.paths.ffmpeg_path,
+                    &visual_cadence,
                 );
                 dashboard_dirty = true;
             }
-            Some(completed) = gemini_receiver.recv() => {
-                if let Err(error) = capture_controller
-                    .acknowledge_window(completed.window.id.clone())
-                    .await
-                {
-                    capture_active = false;
-                    health.stream_capture = component(
-                        "STOPPED",
-                        format!("capture stopped before window acknowledgement: {error:#}"),
-                    );
-                    append_pipeline_audit(
+            _ = blocker_timer.tick() => {
+                let mut ready_dispatches = Vec::new();
+                for event in blocker_dispatcher.advance_to(Utc::now().timestamp_millis()) {
+                    match event {
+                        DispatchEvent::Blocked { audit, .. } | DispatchEvent::ExpiredNormal { audit } => {
+                            acknowledge_terminal_source_segment(
+                                &capture_controller,
+                                &mut source_segments,
+                                audit.sequence,
+                            ).await?;
+                        }
+                        DispatchEvent::FullSet { clips } => {
+                            if let Some(ready) = take_ready_dispatch(clips, &mut source_segments) {
+                                ready_dispatches.push(ready);
+                            }
+                        }
+                        DispatchEvent::MustSolo { clip } => {
+                            if let Some(ready) = take_ready_dispatch(vec![clip], &mut source_segments) {
+                                ready_dispatches.push(ready);
+                            }
+                        }
+                    }
+                }
+                for ready in ready_dispatches {
+                    enqueue_ready_dispatch(
+                        &capture_controller,
                         &mut audit_writer,
-                        "capture",
-                        "acknowledgement_skipped",
-                        "capture worker stopped before a completed Gemini acknowledgement",
-                    )?;
+                        &mut pending_dispatch,
+                        ready,
+                    )
+                    .await?;
+                }
+                launch_next_ready_dispatch(
+                    &mut pending_dispatch,
+                    &mut candidate_watches,
+                    &known_routes,
+                    &broker,
+                    &latest_ticks,
+                    analysis_client.clone(),
+                    analysis_sender.clone(),
+                    &mut health,
+                    &mut session_view,
+                    rolling_context.as_ref(),
+                    &mut analysis_dispatch,
+                    &config.paths.ffmpeg_path,
+                    &visual_cadence,
+                );
+            }
+            Some(completed) = analysis_receiver.recv() => {
+                if let Some(image) = completed.recovery_image.clone() {
+                    recovery_buffer.push_image(image);
+                }
+                session_view.analysis_latency_ms = Some(completed.latency_ms);
+                if let Some(note) = completed.visual_note.as_deref() {
+                    append_pipeline_audit(&mut audit_writer, "analysis", "visual_fallback", note)?;
                     runtime_logger
-                        .record(
-                            "ERROR",
-                            "capture",
-                            "WINDOW_ACK_FAILED",
-                            "capture window acknowledgement failed after multimodal analysis",
-                        )
+                        .record("WARN", "analysis", "VISUAL_FALLBACK", note)
                         .await;
                 }
-                session_view.gemini_latency_ms = Some(completed.latency_ms);
-                let sequence = completed.window.sequence;
-                if !gemini_dispatch.owns(sequence) {
-                    health.gemini = component(
+                let sequence = completed.dispatch.sequence;
+                if !analysis_dispatch.owns(sequence) {
+                    acknowledge_ready_dispatch(&capture_controller, &completed.dispatch).await?;
+                    health.analysis = component(
                         "DEGRADED",
-                        format!("discarded out-of-sequence Gemini result for window {sequence}"),
+                        format!("discarded out-of-sequence Analysis result for window {sequence}"),
                     );
                     append_pipeline_audit(
                         &mut audit_writer,
-                        "gemini",
+                        "analysis",
                         "sequence_mismatch",
-                        &format!("received window {sequence} while {:?} was active", gemini_dispatch.active_sequence),
+                        &format!("received window {sequence} while {:?} was active", analysis_dispatch.active_sequence),
                     )?;
                     runtime_logger
                         .record(
                             "WARN",
-                            "gemini",
+                            "analysis",
                             "SEQUENCE_MISMATCH",
-                            &format!("discarded out-of-sequence Gemini result for window {sequence}"),
+                            &format!("discarded out-of-sequence Analysis result for window {sequence}"),
                         )
                         .await;
                 } else {
                     match completed.result.clone() {
                         Ok(analysis) => {
-                            let context_trading_date = ist_trading_date(completed.window.ended_at_utc);
-                            let envelope = StreamContextEnvelope {
-                                schema_version: STREAM_CONTEXT_SCHEMA_VERSION,
-                                stream_url: stream_url.clone(),
-                                trading_date_ist: context_trading_date,
-                                updated_at: Utc::now(),
-                                source_window_sequence: sequence,
-                                source_clip_ended_at: completed.window.ended_at_utc,
-                                rolling_context: analysis.rolling_context.clone(),
-                            };
-                            health.gemini = component(
+                            let envelope = StreamContextEnvelope::for_analysis(
+                                stream_url.clone(),
+                                sequence,
+                                completed.dispatch.ended_at(),
+                                analysis.rolling_context.clone(),
+                                Utc::now(),
+                            );
+                            health.analysis = component(
                                 "PROCESSING",
                                 "validated analysis complete; committing rolling context",
                             );
@@ -826,25 +1102,31 @@ async fn run_internal(
                             );
                         }
                         Err(error) => {
-                            health.gemini = component("DEGRADED", error.clone());
-                            append_pipeline_audit(&mut audit_writer, "gemini", "error", &error)?;
+                            acknowledge_ready_dispatch(&capture_controller, &completed.dispatch).await?;
+                            health.analysis = if error.starts_with("OpenAI keys are required") {
+                                component("KEYS_REQUIRED", "add one to three OpenAI keys in the dashboard")
+                            } else {
+                                component("DEGRADED", error.clone())
+                            };
+                            append_pipeline_audit(&mut audit_writer, "analysis", "error", &error)?;
                             runtime_logger
-                                .record("ERROR", "gemini", "ANALYSIS_FAILED", &error)
+                                .record("ERROR", "analysis", "ANALYSIS_FAILED", &error)
                                 .await;
-                            let _ = gemini_dispatch.finish(sequence);
-                            launch_next_ready_window(
-                                &mut pending_windows,
-                                &mut transcripts,
+                            let _ = analysis_dispatch.finish(sequence);
+                            launch_next_ready_dispatch(
+                                &mut pending_dispatch,
                                 &mut candidate_watches,
                                 &known_routes,
                                 &broker,
                                 &latest_ticks,
-                                gemini_client.clone(),
-                                gemini_sender.clone(),
+                                analysis_client.clone(),
+                                analysis_sender.clone(),
                                 &mut health,
                                 &mut session_view,
                                 rolling_context.as_ref(),
-                                &mut gemini_dispatch,
+                                &mut analysis_dispatch,
+                                &config.paths.ffmpeg_path,
+                                &visual_cadence,
                             );
                         }
                     }
@@ -853,8 +1135,9 @@ async fn run_internal(
             }
             Some(committed) = context_commit_receiver.recv() => {
                 let sequence = committed.envelope.source_window_sequence;
-                if !gemini_dispatch.owns(sequence) {
-                    health.gemini = component(
+                if !analysis_dispatch.owns(sequence) {
+                    acknowledge_ready_dispatch(&capture_controller, &committed.completed.dispatch).await?;
+                    health.analysis = component(
                         "DEGRADED",
                         format!("discarded out-of-sequence context commit for window {sequence}"),
                     );
@@ -862,7 +1145,7 @@ async fn run_internal(
                         &mut audit_writer,
                         "stream_context",
                         "sequence_mismatch",
-                        &format!("committed window {sequence} while {:?} was active", gemini_dispatch.active_sequence),
+                        &format!("committed window {sequence} while {:?} was active", analysis_dispatch.active_sequence),
                     )?;
                     runtime_logger
                         .record(
@@ -880,25 +1163,37 @@ async fn run_internal(
                             &active_trading_date_ist,
                         ) => {
                             rolling_context = Some(committed.envelope.rolling_context.clone());
+                            visual_cadence.record_committed(
+                                committed.completed.visual_sent,
+                                Utc::now(),
+                            );
+                            session_view.visual_status = Some(visual_cadence.status());
+                            session_view.last_visual_at = visual_cadence
+                                .last_visual_at
+                                .map(|timestamp| timestamp.to_rfc3339());
                             health.persistence = component(
                                 "HEALTHY",
                                 format!("rolling context committed through window {sequence}"),
                             );
-                            health.gemini = healthy_with_latency(
+                            health.analysis = healthy_with_latency(
                                 "strict multimodal analysis and context commit complete",
                                 committed.completed.latency_ms,
                             );
-                            // A candidate is consumed only after its observed
-                            // LTP reached a validated, durably committed call.
-                            // Failed API/validation/commit attempts keep the
-                            // watch and its renewing subscription intact.
-                            candidate_watches.retain(|watch| {
-                                !committed.completed.observed_candidate_ids.contains(
-                                    &watch.route.paper.instrument_id,
-                                )
-                            });
+                            // Observing a quote merely makes a candidate
+                            // eligible for analysis. Keep its renewing feed
+                            // until an actual paper order is placed; route,
+                            // freshness, capital, duplicate, and zero-order
+                            // results must remain observable/retriable.
+                            // The model-supplied context is provisional.  Keep a
+                            // recoverable copy until a paper-broker checkpoint
+                            // exists; otherwise a crash between these two writes
+                            // could permanently suppress a valid entry call.
+                            let provisional_context = rolling_context
+                                .as_ref()
+                                .expect("committed rolling context was just installed")
+                                .clone();
                             let mut finalized_envelope = committed.envelope.clone();
-                            apply_analysis(
+                            let placed_candidate_ids = apply_analysis(
                                 committed.analysis,
                                 &committed.completed,
                                 &instruments,
@@ -911,10 +1206,18 @@ async fn run_internal(
                                     .as_mut()
                                     .expect("committed rolling context was just installed"),
                             ).await;
-                            if let Err(error) = atomic_write_json_snapshot(
+                            candidate_watches.retain(|watch| {
+                                !candidate_consumed_by_actual_placement(
+                                    &watch.route.paper.instrument_id,
+                                    &placed_candidate_ids,
+                                )
+                            });
+                            let broker_snapshot_ok = match atomic_write_json_snapshot(
                                 &broker_state_path,
                                 &broker,
                             ) {
+                                Ok(()) => true,
+                                Err(error) => {
                                 health.persistence = component(
                                     "DEGRADED",
                                     "paper action outcome could not be snapshotted immediately",
@@ -933,13 +1236,32 @@ async fn run_internal(
                                         &error.to_string(),
                                     )
                                     .await;
+                                false
+                            }
+                            };
+                            let action_context = rolling_context
+                                .as_ref()
+                                .expect("committed rolling context remains installed")
+                                .clone();
+                            rolling_context = Some(context_after_broker_checkpoint(
+                                provisional_context,
+                                action_context,
+                                broker_snapshot_ok,
+                            ));
+                            if !broker_snapshot_ok {
+                                // Do not let a final context persist an entry
+                                // outcome that has no durable broker evidence.
+                                health.analysis = component(
+                                    "DEGRADED",
+                                    "paper outcome is not durable; entry context remains retriable",
+                                );
                             }
                             finalized_envelope.updated_at = Utc::now();
                             finalized_envelope.rolling_context = rolling_context
                                 .as_ref()
                                 .expect("committed rolling context remains installed")
                                 .clone();
-                            if let Err(error) = atomic_write_json_snapshot(
+                            if broker_snapshot_ok && let Err(error) = atomic_write_json_snapshot(
                                 &stream_context_path,
                                 &finalized_envelope,
                             ) {
@@ -962,7 +1284,7 @@ async fn run_internal(
                                     )
                                     .await;
                             }
-                            if let Some(store) = neon_store.as_ref()
+                            if broker_snapshot_ok && let Some(store) = neon_store.as_ref()
                                 && let Err(error) = save_neon_runtime(
                                     store,
                                     &broker,
@@ -1002,7 +1324,7 @@ async fn run_internal(
                             )?;
                         }
                         Ok(()) => {
-                            health.gemini = component(
+                            health.analysis = component(
                                 "DEGRADED",
                                 "discarded analysis because its context envelope no longer matches the active stream day",
                             );
@@ -1026,7 +1348,7 @@ async fn run_internal(
                                 "DEGRADED",
                                 "rolling context commit failed; trade actions were discarded",
                             );
-                            health.gemini = component(
+                            health.analysis = component(
                                 "DEGRADED",
                                 "analysis discarded because rolling context was not committed",
                             );
@@ -1041,20 +1363,22 @@ async fn run_internal(
                                 .await;
                         }
                     }
-                    let _ = gemini_dispatch.finish(sequence);
-                    launch_next_ready_window(
-                        &mut pending_windows,
-                        &mut transcripts,
+                    acknowledge_ready_dispatch(&capture_controller, &committed.completed.dispatch).await?;
+                    let _ = analysis_dispatch.finish(sequence);
+                    launch_next_ready_dispatch(
+                        &mut pending_dispatch,
                         &mut candidate_watches,
                         &known_routes,
                         &broker,
                         &latest_ticks,
-                        gemini_client.clone(),
-                        gemini_sender.clone(),
+                        analysis_client.clone(),
+                        analysis_sender.clone(),
                         &mut health,
                         &mut session_view,
                         rolling_context.as_ref(),
-                        &mut gemini_dispatch,
+                        &mut analysis_dispatch,
+                        &config.paths.ffmpeg_path,
+                        &visual_cadence,
                     );
                 }
                 dashboard_dirty = true;
@@ -1246,18 +1570,31 @@ async fn run_internal(
             }
             _ = dashboard_timer.tick(), if dashboard_dirty => {
                 update_live_ages(&mut session_view, &mut health);
-                health.api_keys = gemini_client
+                health.api_keys = analysis_client
                     .key_health()
                     .await
                     .into_iter()
                     .map(|slot| ApiKeyHealthView {
-                        provider: "Gemini".to_owned(),
+                        provider: "OpenAI / Luna".to_owned(),
                         slot: slot.slot,
                         status: slot.state,
                         successes: slot.successes,
                         failures: slot.failures,
                         cooldown_remaining_ms: slot.cooldown_remaining_ms,
                         last_failure: slot.last_failure,
+                        request_limit: slot.rate_limit.as_ref().and_then(|rate| rate.request_limit),
+                        request_remaining: slot.rate_limit.as_ref().and_then(|rate| rate.request_remaining),
+                        request_reset_ms: slot.rate_limit.as_ref().and_then(|rate| rate.request_reset_ms),
+                        token_limit: slot.rate_limit.as_ref().and_then(|rate| rate.token_limit),
+                        token_remaining: slot.rate_limit.as_ref().and_then(|rate| rate.token_remaining),
+                        token_reset_ms: slot.rate_limit.as_ref().and_then(|rate| rate.token_reset_ms),
+                        retry_after_ms: slot.rate_limit.as_ref().and_then(|rate| rate.retry_after_ms),
+                        observed_day_ist: (!slot.daily_usage.day_ist.is_empty())
+                            .then_some(slot.daily_usage.day_ist),
+                        observed_daily_requests: slot.daily_usage.request_count,
+                        observed_daily_input_tokens: slot.daily_usage.input_tokens,
+                        observed_daily_output_tokens: slot.daily_usage.output_tokens,
+                        observed_daily_total_tokens: slot.daily_usage.total_tokens,
                     })
                     .chain(stt_client.key_health().await.into_iter().map(|slot| {
                         ApiKeyHealthView {
@@ -1268,6 +1605,7 @@ async fn run_internal(
                             failures: slot.failures,
                             cooldown_remaining_ms: slot.cooldown_remaining_ms,
                             last_failure: slot.last_failure,
+                            ..ApiKeyHealthView::default()
                         }
                     }))
                     .collect();
@@ -1335,7 +1673,7 @@ async fn save_neon_runtime(
     broker: &PaperBroker,
     stream_url: &str,
     trading_date_ist: &str,
-    rolling_context: Option<&gemini::RollingContext>,
+    rolling_context: Option<&analysis::RollingContext>,
     history: &[HistoryTrade],
     equity_curve: &[EquityPoint],
 ) -> Result<()> {
@@ -1411,58 +1749,134 @@ fn spawn_stt_job(
     });
 }
 
+fn take_ready_dispatch(
+    clips: Vec<RetainedClip>,
+    source_segments: &mut BTreeMap<u64, MediaSegment>,
+) -> Option<ReadyDispatch> {
+    if !clips
+        .iter()
+        .all(|clip| source_segments.contains_key(&clip.sequence))
+    {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(clips.len());
+    for clip in &clips {
+        segments.push(
+            source_segments
+                .remove(&clip.sequence)
+                .expect("source-segment presence was verified before transfer"),
+        );
+    }
+    let sequence = clips.iter().map(|clip| clip.sequence).max()?;
+    Some(ReadyDispatch {
+        sequence,
+        clips,
+        segments,
+    })
+}
+
+struct ReadyDispatchEnqueue {
+    superseded: Option<ReadyDispatch>,
+    incoming: ReadyDispatch,
+}
+
+/// Remove the old pending dispatch before its terminal release. The caller
+/// must ACK/audit `superseded` and only then commit `incoming` as pending.
+fn begin_ready_dispatch_enqueue(
+    pending: &mut Option<ReadyDispatch>,
+    incoming: ReadyDispatch,
+) -> ReadyDispatchEnqueue {
+    ReadyDispatchEnqueue {
+        superseded: pending.take(),
+        incoming,
+    }
+}
+
+impl ReadyDispatchEnqueue {
+    fn commit(self, pending: &mut Option<ReadyDispatch>) {
+        debug_assert!(pending.is_none());
+        *pending = Some(self.incoming);
+    }
+}
+
+/// Retain only the newest unsent dispatch. A superseded dispatch is terminally
+/// ACKed and audited before the replacement becomes visible to the launcher.
+/// This applies for every blocker event regardless of active model state.
+async fn enqueue_ready_dispatch(
+    controller: &crate::capture::CaptureController,
+    audit_writer: &mut JsonlEventWriter,
+    pending: &mut Option<ReadyDispatch>,
+    incoming: ReadyDispatch,
+) -> Result<()> {
+    let enqueue = begin_ready_dispatch_enqueue(pending, incoming);
+    if let Some(stale) = enqueue.superseded.as_ref() {
+        acknowledge_ready_dispatch(controller, stale).await?;
+        append_pipeline_audit(
+            audit_writer,
+            "analysis",
+            "SUPERSEDED",
+            &format!("discarded unsent dispatch {}", stale.sequence),
+        )?;
+    }
+    enqueue.commit(pending);
+    Ok(())
+}
+
+async fn acknowledge_ready_dispatch(
+    controller: &crate::capture::CaptureController,
+    dispatch: &ReadyDispatch,
+) -> Result<()> {
+    for segment in &dispatch.segments {
+        controller.acknowledge_segment(segment.id.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn acknowledge_terminal_source_segment(
+    controller: &crate::capture::CaptureController,
+    source_segments: &mut BTreeMap<u64, MediaSegment>,
+    sequence: u64,
+) -> Result<()> {
+    if let Some(segment) = source_segments.remove(&sequence) {
+        controller.acknowledge_segment(segment.id).await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn launch_next_ready_window(
-    pending: &mut BTreeMap<u64, MediaWindow>,
-    transcripts: &mut BTreeMap<u64, TranscriptChunk>,
+fn launch_next_ready_dispatch(
+    pending: &mut Option<ReadyDispatch>,
     candidates: &mut Vec<CandidateWatch>,
     known_routes: &HashMap<String, RoutedContract>,
     broker: &PaperBroker,
     latest_ticks: &LatestTicks,
-    client: Arc<GeminiClient>,
-    sender: mpsc::Sender<GeminiCompleted>,
+    client: Arc<AnalysisClient>,
+    sender: mpsc::Sender<AnalysisCompleted>,
     health: &mut HealthView,
     session: &mut SessionView,
-    rolling_context: Option<&gemini::RollingContext>,
-    dispatch: &mut GeminiDispatchState,
+    rolling_context: Option<&analysis::RollingContext>,
+    dispatch: &mut AnalysisDispatchState,
+    ffmpeg_path: &Path,
+    visual_cadence: &VisualCadence,
 ) {
     if dispatch.active_sequence.is_some() {
         return;
     }
 
-    // Do not skip an older window whose STT is still finishing. Strict FIFO is
-    // what makes every response the context source for exactly the next call.
-    let Some((&sequence, oldest)) = pending.first_key_value() else {
+    // There is never a FIFO backlog: while one call is active, the runtime
+    // retains only the latest fully selected dispatch. This prevents stale
+    // scalp decisions from accumulating behind a slow provider response.
+    let Some(ready) = pending.take() else {
         return;
     };
-    if oldest.segments.len() != WINDOW_SEGMENTS
-        || !oldest
-            .segments
-            .iter()
-            .all(|segment| transcripts.contains_key(&segment.sequence))
-    {
-        return;
-    }
+    let sequence = ready.sequence;
     if !dispatch.try_begin(sequence) {
+        *pending = Some(ready);
         return;
     }
-
-    let window = pending
-        .remove(&sequence)
-        .expect("the oldest pending Gemini window was just observed");
-    let chunks = window
-        .segments
-        .iter()
-        .map(|segment| {
-            transcripts
-                .remove(&segment.sequence)
-                .expect("window readiness checked every transcript sequence")
-        })
-        .collect::<Vec<_>>();
     let sent_at = Utc::now();
     let input = build_analysis_input(
-        &window,
-        &chunks,
+        &ready,
         sent_at,
         candidates,
         known_routes,
@@ -1470,18 +1884,8 @@ fn launch_next_ready_window(
         latest_ticks,
         rolling_context,
     );
-    let observed_candidate_ids = candidates
-        .iter()
-        .filter(|watch| candidate_observation_is_complete(watch, latest_ticks))
-        .filter(|watch| {
-            input
-                .watched_options
-                .iter()
-                .any(|option| option.contract == watch.route.gemini && option.price.ltp.is_some())
-        })
-        .map(|watch| watch.route.paper.instrument_id.clone())
-        .collect::<HashSet<_>>();
-    let transcript_excerpt = chunks
+    let transcript_excerpt = ready
+        .clips
         .iter()
         .map(|chunk| chunk.text.trim())
         .filter(|text| !text.is_empty())
@@ -1489,30 +1893,56 @@ fn launch_next_ready_window(
         .join(" ");
     session.last_prompt_at = Some(sent_at.to_rfc3339());
     session.clip_age_ms = Some(input.clip.data_age_ms);
-    session.transcript_segments_ready = transcripts.len();
-    health.gemini = component(
+    session.transcript_segments_ready = 0;
+    let visual_due = visual_cadence.visual_due();
+    session.visual_status = Some(if visual_due {
+        "frame extraction scheduled for this analysis".to_owned()
+    } else {
+        visual_cadence.status()
+    });
+    health.analysis = component(
         "PROCESSING",
         format!(
-            "analyzing synchronized 8-second window {sequence} ({} queued)",
-            pending.len()
+            "analyzing {} selected 3-second source segments through {sequence}",
+            ready.clips.len()
         ),
     );
+    let ffmpeg_path = ffmpeg_path.to_path_buf();
     tokio::spawn(async move {
         let started = Instant::now();
-        let result = if window.inline_upload_safe {
-            client
-                .analyze_video_file(&input, &window.path)
-                .await
-                .map_err(|error| format!("{error:#}"))
+        let (jpeg, visual_sent, visual_note) = if visual_due {
+            match extract_latest_selected_jpeg(&ffmpeg_path, &ready.segments).await {
+                Ok(jpeg) => (Some(jpeg), true, None),
+                Err(_) => (
+                    None,
+                    false,
+                    Some("original frame unavailable; continuing text-only and retaining visual due state".to_owned()),
+                ),
+            }
         } else {
-            Err("8-second clip exceeds the safe inline upload limit".to_owned())
+            (None, false, None)
         };
-        let completed = GeminiCompleted {
-            window,
+        let result = client
+            .analyze(&input, jpeg.as_deref())
+            .await
+            .map_err(|error| format!("{error:#}"));
+        let recovery_image = jpeg.map(|jpeg| RecoveryImage {
+            source_sequence: ready
+                .segments
+                .iter()
+                .map(|segment| segment.sequence)
+                .max()
+                .unwrap_or_default(),
+            jpeg,
+        });
+        let completed = AnalysisCompleted {
+            dispatch: ready,
             input,
             transcript_excerpt,
-            observed_candidate_ids,
             latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            visual_sent,
+            visual_note,
+            recovery_image,
             result,
         };
         let _ = sender.send(completed).await;
@@ -1521,7 +1951,7 @@ fn launch_next_ready_window(
 
 fn spawn_context_commit_job(
     path: std::path::PathBuf,
-    completed: GeminiCompleted,
+    completed: AnalysisCompleted,
     analysis: ValidatedAnalysis,
     envelope: StreamContextEnvelope,
     sender: mpsc::Sender<ContextCommitCompleted>,
@@ -1561,6 +1991,13 @@ fn candidate_observation_is_complete(watch: &CandidateWatch, latest: &LatestTick
             .is_some_and(|tick| tick.received_timestamp_ms >= watch.watched_since_timestamp_ms)
 }
 
+fn candidate_consumed_by_actual_placement(
+    instrument_id: &str,
+    actual_placement_instruments: &HashSet<String>,
+) -> bool {
+    actual_placement_instruments.contains(instrument_id)
+}
+
 fn candidate_lease_needs_renewal(remaining: Option<Duration>) -> bool {
     remaining
         .is_some_and(|remaining| remaining <= Duration::from_secs(CANDIDATE_RENEW_AHEAD_SECONDS))
@@ -1590,26 +2027,24 @@ async fn renew_candidate_watches(
 }
 
 fn build_analysis_input(
-    window: &MediaWindow,
-    chunks: &[TranscriptChunk],
+    dispatch: &ReadyDispatch,
     sent_at: DateTime<Utc>,
     candidates: &[CandidateWatch],
     known_routes: &HashMap<String, RoutedContract>,
     broker: &PaperBroker,
     latest: &LatestTicks,
-    rolling_context: Option<&gemini::RollingContext>,
+    rolling_context: Option<&analysis::RollingContext>,
 ) -> AnalysisInput {
-    let transcripts = window
+    let transcripts = dispatch
         .segments
         .iter()
-        .zip(chunks.iter())
-        .enumerate()
-        .map(|(index, (segment, chunk))| gemini::TranscriptChunk {
-            index: index as u8,
+        .zip(dispatch.clips.iter())
+        .map(|(segment, clip)| analysis::TranscriptChunk {
+            source_sequence: segment.sequence,
             started_at: segment.started_at_utc,
             ended_at: segment.ended_at_utc,
-            text: chunk.text.clone(),
-            complete: chunk.status == TranscriptStatus::Complete,
+            text: clip.text.clone(),
+            complete: true,
         })
         .collect::<Vec<_>>();
 
@@ -1654,7 +2089,7 @@ fn build_analysis_input(
                 .max()
                 .unwrap_or_default();
             WatchedOptionSnapshot {
-                contract: route.gemini.clone(),
+                contract: route.analysis.clone(),
                 price: PriceSnapshot {
                     ltp: tick.as_ref().map(|tick| tick.ltp),
                     observed_at: tick
@@ -1672,12 +2107,15 @@ fn build_analysis_input(
 
     AnalysisInput {
         clip: ClipWindow {
-            started_at: window.started_at_utc,
-            ended_at: window.ended_at_utc,
+            started_at: dispatch.started_at(),
+            ended_at: dispatch.ended_at(),
             sent_at,
-            data_age_ms: age_ms(window.ended_at_utc, sent_at),
-            complete: window.segments.len() == WINDOW_SEGMENTS
-                && window.duration_ms == WINDOW_SECONDS * 1_000,
+            data_age_ms: age_ms(dispatch.ended_at(), sent_at),
+            complete: matches!(dispatch.segments.len(), 1 | 4)
+                && dispatch
+                    .segments
+                    .iter()
+                    .all(|segment| (2_500..=3_500).contains(&segment.duration_ms)),
         },
         transcripts,
         watched_options,
@@ -1690,7 +2128,7 @@ fn open_trade_snapshots(
     snapshot: &PaperBrokerSnapshot,
     known_routes: &HashMap<String, RoutedContract>,
     latest: &LatestTicks,
-) -> Vec<gemini::OpenTradeSnapshot> {
+) -> Vec<analysis::OpenTradeSnapshot> {
     let Some(llm_shadow) = snapshot
         .shadows
         .iter()
@@ -1722,9 +2160,9 @@ fn open_trade_snapshots(
                 .sum();
             let tick = latest.get(&route.instrument);
             let tick_age = tick.as_ref().map(Tick::age);
-            Some(gemini::OpenTradeSnapshot {
+            Some(analysis::OpenTradeSnapshot {
                 trade_id: setup_id,
-                contract: route.gemini.clone(),
+                contract: route.analysis.clone(),
                 quantity,
                 entry_price: paise_to_rupees(first.entry_price_paise),
                 price: PriceSnapshot {
@@ -1752,18 +2190,19 @@ fn open_trade_snapshots(
 #[allow(clippy::too_many_arguments)]
 async fn apply_analysis(
     analysis: ValidatedAnalysis,
-    completed: &GeminiCompleted,
+    completed: &AnalysisCompleted,
     instruments: &[InstrumentRow],
     feed_handle: &MarketFeedHandle,
     candidates: &mut Vec<CandidateWatch>,
     known_routes: &mut HashMap<String, RoutedContract>,
     broker: &mut PaperBroker,
     signals: &mut Vec<SignalView>,
-    rolling_context: &mut gemini::RollingContext,
-) {
+    rolling_context: &mut analysis::RollingContext,
+) -> HashSet<String> {
     let received_at = Utc::now();
     let bias = format!("{:?}", analysis.market_bias.direction).to_ascii_uppercase();
     let freshness = format!("{:?}", analysis.freshness.status).to_ascii_uppercase();
+    let mut actual_placement_instruments = HashSet::new();
 
     for rejected in analysis.rejected_actions {
         push_signal(
@@ -1784,6 +2223,14 @@ async fn apply_analysis(
     for action in analysis.actions {
         if let Some(reason) = executable_action_freshness_issue(&action, completed, received_at) {
             reconcile_entry_application(rolling_context, &action, false);
+            record_authoritative_outcome(
+                rolling_context,
+                &action,
+                false,
+                None,
+                &format!("Runtime action rejection: {reason}"),
+                received_at,
+            );
             push_signal(
                 signals,
                 signal_view(
@@ -1872,6 +2319,10 @@ async fn apply_analysis(
                                         placement.status,
                                         placement.orders_placed,
                                     );
+                                    if accepted {
+                                        actual_placement_instruments
+                                            .insert(route.paper.instrument_id.clone());
+                                    }
                                     decision = placement.rejection_reason.unwrap_or_else(|| {
                                         if placement.orders_placed > 0 {
                                             format!(
@@ -1937,11 +2388,8 @@ async fn apply_analysis(
                                 setup_id = find_setup_for_contract(broker, &route.paper)
                                     .unwrap_or_default();
                             }
-                            let events = broker.request_llm_exit(
-                                &setup_id,
-                                action.confidence_pct,
-                                received_at.timestamp_millis(),
-                            );
+                            let events =
+                                broker.request_llm_exit(&setup_id, received_at.timestamp_millis());
                             accepted = events
                                 .iter()
                                 .any(|event| event.event_type == paper::EventType::LlmExitQueued);
@@ -1964,6 +2412,14 @@ async fn apply_analysis(
             },
         }
 
+        record_authoritative_outcome(
+            rolling_context,
+            &action,
+            accepted,
+            (!setup_id.trim().is_empty()).then_some(setup_id.clone()),
+            &decision,
+            received_at,
+        );
         push_signal(
             signals,
             signal_view(
@@ -1979,10 +2435,38 @@ async fn apply_analysis(
         );
         reconcile_entry_application(rolling_context, &action, accepted);
     }
+    actual_placement_instruments
+}
+
+fn record_authoritative_outcome(
+    context: &mut analysis::RollingContext,
+    action: &TradeAction,
+    accepted: bool,
+    setup_id: Option<String>,
+    detail: &str,
+    occurred_at: DateTime<Utc>,
+) {
+    let status = if accepted { "APPLIED" } else { "REJECTED" };
+    context
+        .authoritative_outcomes
+        .push(analysis::AuthoritativeOutcome {
+            action: action.action,
+            episode_id: action.episode_id.clone(),
+            event_id: action.event_id.clone(),
+            setup_id,
+            status: status.to_owned(),
+            detail: detail.chars().take(280).collect(),
+            occurred_at: occurred_at.to_rfc3339(),
+        });
+    const MAX_AUTHORITATIVE_OUTCOMES: usize = 24;
+    if context.authoritative_outcomes.len() > MAX_AUTHORITATIVE_OUTCOMES {
+        let drop_count = context.authoritative_outcomes.len() - MAX_AUTHORITATIVE_OUTCOMES;
+        context.authoritative_outcomes.drain(..drop_count);
+    }
 }
 
 fn reconcile_entry_application(
-    context: &mut gemini::RollingContext,
+    context: &mut analysis::RollingContext,
     action: &TradeAction,
     placed: bool,
 ) {
@@ -2008,37 +2492,111 @@ fn reconcile_entry_application(
     let Some(episode_index) = episode_index else {
         return;
     };
-    let episode = &mut context.episodes[episode_index];
-
     if placed {
+        let episode = &mut context.episodes[episode_index];
         episode.entry_event_id = action.event_id.clone();
-        episode.status = gemini::TradeEpisodeStatus::EntryCalled;
-    } else if episode.entry_event_id == action.event_id {
-        // The current media contained a real entry call, but the paper runtime
-        // could not create any order. Clear only the tentative local event so
-        // a later, fresh and better-specified call can be evaluated again.
+        episode.status = analysis::TradeEpisodeStatus::EntryCalled;
+    } else {
+        let episode_id = context.episodes[episode_index].episode_id.clone();
+        let entry_event_id = context.episodes[episode_index].entry_event_id.clone();
+        let current_entry_is_proven = entry_event_id.as_deref().is_some_and(|event_id| {
+            context.authoritative_outcomes.iter().any(|outcome| {
+                outcome.action == ActionKind::PlaceEntry
+                    && outcome.status == "APPLIED"
+                    && outcome.episode_id.as_deref() == Some(episode_id.as_str())
+                    && outcome.event_id.as_deref() == Some(event_id)
+            })
+        });
+        if current_entry_is_proven {
+            return;
+        }
+        // A rejected proposal must never leave an ENTRY_CALLED/event marker
+        // behind merely because a model supplied a different id than the
+        // tentative context value. A later fresh call stays retriable.
+        let episode = &mut context.episodes[episode_index];
         episode.entry_event_id = None;
-        if episode.status == gemini::TradeEpisodeStatus::EntryCalled {
-            episode.status = gemini::TradeEpisodeStatus::ConditionalEntry;
+        if episode.status == analysis::TradeEpisodeStatus::EntryCalled {
+            episode.status = analysis::TradeEpisodeStatus::ConditionalEntry;
+        }
+    }
+}
+
+fn context_after_broker_checkpoint(
+    provisional: analysis::RollingContext,
+    action_outcome: analysis::RollingContext,
+    broker_snapshot_ok: bool,
+) -> analysis::RollingContext {
+    if broker_snapshot_ok {
+        action_outcome
+    } else {
+        provisional
+    }
+}
+
+/// A rolling context is supplementary memory, never proof of an order. On
+/// restart only retain a placement outcome when the selected broker snapshot
+/// contains the corresponding accepted setup.
+fn reconcile_restored_context_with_broker(
+    context: &mut analysis::RollingContext,
+    broker: &PaperBroker,
+) {
+    context.authoritative_outcomes.retain(|outcome| {
+        outcome.action != ActionKind::PlaceEntry
+            || outcome.status != "APPLIED"
+            || outcome
+                .setup_id
+                .as_deref()
+                .is_some_and(|setup_id| broker.contains_accepted_setup(setup_id))
+    });
+
+    let runtime_outcomes = context.authoritative_outcomes.clone();
+    for episode in &mut context.episodes {
+        let is_entry_marked = episode.status == analysis::TradeEpisodeStatus::EntryCalled
+            || episode.entry_event_id.is_some();
+        if !is_entry_marked {
+            continue;
+        }
+        let proven = episode.entry_event_id.as_deref().is_some_and(|event_id| {
+            runtime_outcomes.iter().any(|outcome| {
+                outcome.action == ActionKind::PlaceEntry
+                    && outcome.status == "APPLIED"
+                    && outcome.episode_id.as_deref() == Some(episode.episode_id.as_str())
+                    && outcome.event_id.as_deref() == Some(event_id)
+                    && outcome
+                        .setup_id
+                        .as_deref()
+                        .is_some_and(|setup_id| broker.contains_accepted_setup(setup_id))
+            })
+        });
+        if !proven {
+            episode.entry_event_id = None;
+            if matches!(
+                episode.status,
+                analysis::TradeEpisodeStatus::EntryCalled
+                    | analysis::TradeEpisodeStatus::Open
+                    | analysis::TradeEpisodeStatus::Managing
+            ) {
+                episode.status = analysis::TradeEpisodeStatus::ConditionalEntry;
+            }
         }
     }
 }
 
 fn executable_action_freshness_issue(
     action: &TradeAction,
-    completed: &GeminiCompleted,
+    completed: &AnalysisCompleted,
     received_at: DateTime<Utc>,
 ) -> Option<String> {
     if !action.action.is_trade_command() {
         return None;
     }
-    if completed.input.clip.started_at != completed.window.started_at_utc
-        || completed.input.clip.ended_at != completed.window.ended_at_utc
+    if completed.input.clip.started_at != completed.dispatch.started_at()
+        || completed.input.clip.ended_at != completed.dispatch.ended_at()
     {
         return Some("analysis input does not match its source media window".to_owned());
     }
     let clip_age_ms = received_at
-        .signed_duration_since(completed.window.ended_at_utc)
+        .signed_duration_since(completed.dispatch.ended_at())
         .num_milliseconds();
     if !(0..=MAX_EXECUTABLE_SIGNAL_AGE_MS).contains(&clip_age_ms) {
         return Some(format!(
@@ -2051,7 +2609,7 @@ fn executable_action_freshness_issue(
     }) else {
         return Some("executable action has no evidence in the current clip".to_owned());
     };
-    let evidence_at = completed.window.started_at_utc
+    let evidence_at = completed.dispatch.started_at()
         + chrono::Duration::milliseconds(
             (latest_evidence.seconds_from_clip_start * 1_000.0).round() as i64,
         );
@@ -2073,24 +2631,23 @@ fn placement_effectively_accepted(status: PlacementStatus, orders_placed: usize)
 fn action_to_setup(
     action: &TradeAction,
     route: &RoutedContract,
-    completed: &GeminiCompleted,
+    completed: &AnalysisCompleted,
     received_at: DateTime<Utc>,
 ) -> Result<TradeSetup> {
-    let levels = action_levels(action)?;
+    let levels = entry_levels_with_fallback(action, route.paper.underlying)?;
     let evidence_timestamp_ms = action
         .evidence_timestamps
         .first()
         .map(|evidence| {
-            completed.window.started_at_utc.timestamp_millis()
+            completed.dispatch.started_at().timestamp_millis()
                 + (evidence.seconds_from_clip_start * 1_000.0).round() as i64
         })
-        .unwrap_or_else(|| completed.window.ended_at_utc.timestamp_millis());
+        .unwrap_or_else(|| completed.dispatch.ended_at().timestamp_millis());
     Ok(TradeSetup {
         setup_id: action.trade_id.clone().unwrap_or_default(),
         contract: route.paper.clone(),
         side: TradeSide::Buy,
         levels,
-        confidence_pct: action.confidence_pct,
         evidence_timestamp_ms,
         received_timestamp_ms: received_at.timestamp_millis(),
     })
@@ -2109,20 +2666,56 @@ fn action_levels(action: &TradeAction) -> Result<PaperLevels> {
     })
 }
 
+/// Uses explicit streamer levels whenever they exist. The fixed fallback is
+/// only for a current, validated entry whose episode contains no explicit SL
+/// or T1: NIFTY is entry-8 / entry+12 and SENSEX is entry-12 / entry+15.
+fn entry_levels_with_fallback(
+    action: &TradeAction,
+    underlying: PaperUnderlying,
+) -> Result<PaperLevels> {
+    let levels = action
+        .levels
+        .as_ref()
+        .ok_or_else(|| anyhow!("entry action has no levels"))?;
+    let entry = levels.entry.ok_or_else(|| anyhow!("entry missing"))?;
+    let (fallback_sl_points, fallback_t1_points) = match underlying {
+        PaperUnderlying::Nifty => (8.0, 12.0),
+        PaperUnderlying::Sensex => (12.0, 15.0),
+    };
+    let hard_sl = levels.hard_sl.unwrap_or(entry - fallback_sl_points);
+    let t1 = levels.t1.unwrap_or(entry + fallback_t1_points);
+    let resolved = PaperLevels {
+        entry_paise: points_to_paise(entry)?,
+        hard_sl_paise: points_to_paise(hard_sl)?,
+        t1_paise: points_to_paise(t1)?,
+        t2_paise: levels.t2.map(points_to_paise).transpose()?,
+    };
+    if resolved.hard_sl_paise <= 0
+        || resolved.hard_sl_paise >= resolved.entry_paise
+        || resolved.t1_paise <= resolved.entry_paise
+        || resolved
+            .t2_paise
+            .is_some_and(|t2_paise| t2_paise <= resolved.t1_paise)
+    {
+        bail!("entry levels and fallback must satisfy BUY level ordering");
+    }
+    Ok(resolved)
+}
+
 fn resolve_route(
     rows: &[InstrumentRow],
-    contract: &gemini::OptionContract,
+    contract: &analysis::OptionContract,
 ) -> Result<RoutedContract> {
     if contract.direction != TradeDirection::Buy {
         bail!("only BUY option contracts can be routed");
     }
     let underlying = match contract.underlying {
-        GeminiUnderlying::Nifty => ("NIFTY", PaperUnderlying::Nifty),
-        GeminiUnderlying::Sensex => ("SENSEX", PaperUnderlying::Sensex),
+        AnalysisUnderlying::Nifty => ("NIFTY", PaperUnderlying::Nifty),
+        AnalysisUnderlying::Sensex => ("SENSEX", PaperUnderlying::Sensex),
     };
     let option_label = match contract.option_type {
-        GeminiOptionType::Ce => "CE",
-        GeminiOptionType::Pe => "PE",
+        AnalysisOptionType::Ce => "CE",
+        AnalysisOptionType::Pe => "PE",
     };
     let explicit_expiry = contract.expiry.as_deref().map(parse_expiry).transpose()?;
     let today = Utc::now().with_timezone(&Kolkata).date_naive();
@@ -2172,7 +2765,7 @@ fn resolve_route(
         row.security_id.clone(),
         row.trading_symbol.clone(),
     )?;
-    let resolved_gemini = gemini::OptionContract {
+    let resolved_analysis = analysis::OptionContract {
         expiry: Some(expiry.format("%Y-%m-%d").to_string()),
         ..contract.clone()
     };
@@ -2183,12 +2776,12 @@ fn resolve_route(
         expiry: expiry.format("%Y-%m-%d").to_string(),
         strike_paise: points_to_paise(contract.strike)?,
         option_kind: match contract.option_type {
-            GeminiOptionType::Ce => OptionKind::Ce,
-            GeminiOptionType::Pe => OptionKind::Pe,
+            AnalysisOptionType::Ce => OptionKind::Ce,
+            AnalysisOptionType::Pe => OptionKind::Pe,
         },
     };
     Ok(RoutedContract {
-        gemini: resolved_gemini,
+        analysis: resolved_analysis,
         paper,
         instrument,
     })
@@ -2234,21 +2827,21 @@ fn route_from_paper_contract(contract: &PaperContract) -> Result<RoutedContract>
         security_id,
         contract.trading_symbol.clone(),
     )?;
-    let gemini = gemini::OptionContract {
+    let analysis = analysis::OptionContract {
         underlying: match contract.underlying {
-            PaperUnderlying::Nifty => GeminiUnderlying::Nifty,
-            PaperUnderlying::Sensex => GeminiUnderlying::Sensex,
+            PaperUnderlying::Nifty => AnalysisUnderlying::Nifty,
+            PaperUnderlying::Sensex => AnalysisUnderlying::Sensex,
         },
         expiry: Some(contract.expiry.clone()),
         strike: paise_to_rupees(contract.strike_paise),
         option_type: match contract.option_kind {
-            OptionKind::Ce => GeminiOptionType::Ce,
-            OptionKind::Pe => GeminiOptionType::Pe,
+            OptionKind::Ce => AnalysisOptionType::Ce,
+            OptionKind::Pe => AnalysisOptionType::Pe,
         },
         direction: TradeDirection::Buy,
     };
     Ok(RoutedContract {
-        gemini,
+        analysis,
         paper: contract.clone(),
         instrument,
     })
@@ -2424,7 +3017,7 @@ fn load_stream_context(
     path: &Path,
     stream_url: &str,
     trading_date_ist: &str,
-) -> Result<Option<gemini::RollingContext>> {
+) -> Result<Option<analysis::RollingContext>> {
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.len() > MAX_STREAM_CONTEXT_FILE_BYTES => {
             bail!(
@@ -2470,7 +3063,7 @@ fn stream_context_envelope_matches(
 
 fn signal_view(
     action: &TradeAction,
-    completed: &GeminiCompleted,
+    completed: &AnalysisCompleted,
     accepted: bool,
     setup_id: String,
     bias: &str,
@@ -2481,14 +3074,14 @@ fn signal_view(
     let contract = action.contract.as_ref();
     let levels = action.levels.as_ref();
     let evidence_start = action.evidence_timestamps.first().map(|evidence| {
-        (completed.window.started_at_utc
+        (completed.dispatch.started_at()
             + chrono::Duration::milliseconds(
                 (evidence.seconds_from_clip_start * 1_000.0).round() as i64
             ))
         .to_rfc3339()
     });
     let evidence_end = action.evidence_timestamps.last().map(|evidence| {
-        (completed.window.started_at_utc
+        (completed.dispatch.started_at()
             + chrono::Duration::milliseconds(
                 (evidence.seconds_from_clip_start * 1_000.0).round() as i64
             ))
@@ -2504,9 +3097,9 @@ fn signal_view(
     SignalView {
         signal_id: format!(
             "{}-{}-{}",
-            completed.window.id,
+            format!("dispatch-{}", completed.dispatch.sequence),
             format!("{:?}", action.action).to_ascii_lowercase(),
-            action.confidence_pct
+            "scoreless"
         ),
         setup_id,
         received_at: Utc::now().to_rfc3339(),
@@ -2530,7 +3123,6 @@ fn signal_view(
         stop_loss: levels.and_then(|levels| levels.hard_sl),
         target_1: levels.and_then(|levels| levels.t1),
         target_2: levels.and_then(|levels| levels.t2),
-        confidence_pct: f64::from(action.confidence_pct),
         market_bias: bias.to_owned(),
         source_age_ms: Some(completed.input.clip.data_age_ms),
         freshness: freshness.to_owned(),
@@ -2670,9 +3262,6 @@ fn merge_closed_history(
             charges: paise_to_rupees(trade.entry_charge_paise + trade.exit_charge_paise),
             net_pnl: paise_to_rupees(trade.net_pnl_paise),
             return_pct,
-            confidence_pct: setup
-                .map(|setup| f64::from(setup.confidence_pct))
-                .unwrap_or_default(),
             max_favorable_price: paise_to_rupees(trade.maximum_ltp_paise),
             max_adverse_price: paise_to_rupees(trade.minimum_ltp_paise),
             notes: format!("paper-only {:?} exit", trade.exit_reason),
@@ -2692,7 +3281,6 @@ fn paper_broker_config(config: &AppConfig) -> Result<PaperBrokerConfig> {
         entry_buffer_paise: points_to_paise(config.trading.entry_buffer_points)?,
         entry_charge_paise: points_to_paise(config.trading.charge_per_fill_rupees)?,
         exit_charge_paise: points_to_paise(config.trading.charge_per_fill_rupees)?,
-        minimum_confidence_pct: config.trading.minimum_confidence_pct.round() as u8,
         pending_entry_ttl_ms: paper::DEFAULT_PENDING_ENTRY_TTL_MS,
         ..PaperBrokerConfig::default()
     })
@@ -2877,7 +3465,7 @@ fn dashboard_state(
 
             for order in &account.pending_entries {
                 let tick = ticks.get(&order.contract.instrument_id).copied();
-                let setup = setups.get(&order.setup_id).copied();
+                let _setup = setups.get(&order.setup_id).copied();
                 pending_orders.push(PendingOrderView {
                     order_id: order.order_id.clone(),
                     setup_id: order.setup_id.clone(),
@@ -2899,9 +3487,6 @@ fn dashboard_state(
                     ),
                     current_ltp: tick.map(|tick| paise_to_rupees(tick.ltp_paise)),
                     reserved_cash: paise_to_rupees(order.reserved_paise),
-                    confidence_pct: setup
-                        .map(|setup| f64::from(setup.confidence_pct))
-                        .unwrap_or_default(),
                     status: "WAITING_FOR_FRESH_MATCH".to_owned(),
                     created_at: timestamp_from_ms(order.created_timestamp_ms).to_rfc3339(),
                     expires_at: None,
@@ -3048,7 +3633,7 @@ fn initial_health() -> HealthView {
         overall: "STARTING".to_owned(),
         stream_capture: component("STARTING", "initializing live-edge capture"),
         transcription: component("STARTING", "loading Scribe v2 credentials"),
-        gemini: component("STARTING", "initializing strict multimodal client"),
+        analysis: component("STARTING", "initializing strict multimodal client"),
         market_feed: component("STARTING", "initializing dynamic market feed"),
         persistence: component("STARTING", "opening durable session files"),
         api_keys: Vec::new(),
@@ -3091,7 +3676,7 @@ fn overall_health(health: &HealthView) -> String {
     let statuses = [
         &health.stream_capture.status,
         &health.transcription.status,
-        &health.gemini.status,
+        &health.analysis.status,
         &health.market_feed.status,
         &health.persistence.status,
     ];
@@ -3194,6 +3779,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_visual_cadence_uses_frame_only_after_four_committed_text_calls() {
+        let mut cadence = VisualCadence::default();
+        assert!(!cadence.visual_due());
+        for _ in 0..4 {
+            cadence.record_committed(false, Utc::now());
+            assert!(!cadence.visual_due() || cadence.commits_since_visual == 4);
+        }
+        assert!(cadence.visual_due());
+        // A due call whose frame extraction fails stays due even if its text
+        // analysis commits, so the next eligible dispatch retries the frame.
+        cadence.record_committed(false, Utc::now());
+        assert!(cadence.visual_due());
+        cadence.record_committed(true, Utc::now());
+        assert!(!cadence.visual_due());
+        assert_eq!(cadence.commits_since_visual, 0);
+    }
+
+    #[test]
+    fn stt_reorder_buffer_delivers_out_of_order_completions_in_capture_sequence_order() {
+        let mut reorder = OrderedSttCompletionBuffer::default();
+        reorder.begin_at(1);
+
+        assert!(reorder.insert(2, "failed-2").is_empty());
+        assert_eq!(
+            reorder.insert(1, "complete-1"),
+            vec!["complete-1", "failed-2"]
+        );
+        assert_eq!(reorder.insert(3, "complete-3"), vec!["complete-3"]);
+        assert!(reorder.is_empty());
+    }
+
+    #[test]
     fn expiry_parser_accepts_model_and_human_forms() {
         let expected = NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
         assert_eq!(parse_expiry("2026-08-13").unwrap(), expected);
@@ -3221,11 +3838,11 @@ mod tests {
                 option_type: "CE".to_owned(),
             },
         ];
-        let mut contract = gemini::OptionContract {
-            underlying: GeminiUnderlying::Nifty,
+        let mut contract = analysis::OptionContract {
+            underlying: AnalysisUnderlying::Nifty,
             expiry: None,
             strike: 25_000.0,
-            option_type: GeminiOptionType::Ce,
+            option_type: AnalysisOptionType::Ce,
             direction: TradeDirection::Buy,
         };
         let error = match resolve_route(&rows, &contract) {
@@ -3357,7 +3974,7 @@ mod tests {
         let config = AppConfig::from_values(
             "C:/project",
             [
-                ("GEMINI_API_KEY", "test-gemini-key"),
+                ("OPENAI_API_KEY", "test-analysis-key"),
                 ("ELEVENLABS_API_KEY", "test-elevenlabs-key"),
             ],
         )
@@ -3425,20 +4042,48 @@ mod tests {
     }
 
     #[test]
+    fn entry_without_streamer_levels_uses_underlying_specific_fallbacks() {
+        let action = TradeAction {
+            action: ActionKind::PlaceEntry,
+            episode_id: Some("episode-1".to_owned()),
+            event_id: Some("event-1".to_owned()),
+            trade_id: None,
+            contract: None,
+            levels: Some(analysis::TradeLevels {
+                entry: Some(100.0),
+                hard_sl: None,
+                t1: None,
+                t2: None,
+            }),
+            evidence_timestamps: Vec::new(),
+            rationale: "current entry call".to_owned(),
+        };
+
+        let nifty = entry_levels_with_fallback(&action, PaperUnderlying::Nifty).unwrap();
+        assert_eq!(nifty.entry_paise, points_to_paise(100.0).unwrap());
+        assert_eq!(nifty.hard_sl_paise, points_to_paise(92.0).unwrap());
+        assert_eq!(nifty.t1_paise, points_to_paise(112.0).unwrap());
+        assert_eq!(nifty.t2_paise, None);
+
+        let sensex = entry_levels_with_fallback(&action, PaperUnderlying::Sensex).unwrap();
+        assert_eq!(sensex.hard_sl_paise, points_to_paise(88.0).unwrap());
+        assert_eq!(sensex.t1_paise, points_to_paise(115.0).unwrap());
+    }
+
+    #[test]
     fn rolling_entry_event_tracks_actual_paper_placement_outcome() {
-        let mut context = gemini::RollingContext {
-            episodes: vec![gemini::TradeEpisodeContext {
+        let mut context = analysis::RollingContext {
+            episodes: vec![analysis::TradeEpisodeContext {
                 episode_id: "episode-1".to_owned(),
                 contract: None,
-                status: gemini::TradeEpisodeStatus::EntryCalled,
+                status: analysis::TradeEpisodeStatus::EntryCalled,
                 levels: None,
                 latest_instruction: "enter now".to_owned(),
                 entry_event_id: Some("event-1".to_owned()),
                 first_seen_at: String::new(),
                 last_updated_at: String::new(),
-                confidence_pct: 80,
             }],
-            ..gemini::RollingContext::default()
+            ..analysis::RollingContext::default()
         };
         let action = TradeAction {
             action: ActionKind::PlaceEntry,
@@ -3447,7 +4092,6 @@ mod tests {
             trade_id: None,
             contract: None,
             levels: None,
-            confidence_pct: 80,
             evidence_timestamps: Vec::new(),
             rationale: "enter now".to_owned(),
         };
@@ -3456,7 +4100,7 @@ mod tests {
         assert_eq!(context.episodes[0].entry_event_id, None);
         assert_eq!(
             context.episodes[0].status,
-            gemini::TradeEpisodeStatus::ConditionalEntry
+            analysis::TradeEpisodeStatus::ConditionalEntry
         );
 
         reconcile_entry_application(&mut context, &action, true);
@@ -3466,19 +4110,152 @@ mod tests {
         );
         assert_eq!(
             context.episodes[0].status,
-            gemini::TradeEpisodeStatus::EntryCalled
+            analysis::TradeEpisodeStatus::EntryCalled
         );
     }
 
     #[test]
-    fn gemini_dispatch_is_single_flight_through_context_commit() {
-        let mut dispatch = GeminiDispatchState::default();
+    fn analysis_dispatch_is_single_flight_through_context_commit() {
+        let mut dispatch = AnalysisDispatchState::default();
         assert!(dispatch.try_begin(7));
         assert!(!dispatch.try_begin(8));
         assert!(!dispatch.finish(8));
         assert!(dispatch.owns(7));
         assert!(dispatch.finish(7));
         assert!(dispatch.try_begin(8));
+    }
+
+    #[test]
+    fn newer_unsent_dispatch_supersedes_and_releases_the_older_owned_segments() {
+        let at = Utc.with_ymd_and_hms(2026, 8, 11, 5, 0, 0).single().unwrap();
+        let ready = |sequence| ReadyDispatch {
+            sequence,
+            clips: vec![RetainedClip {
+                sequence,
+                start_ms: at.timestamp_millis(),
+                duration_ms: 3_000,
+                text: format!("segment {sequence}"),
+                must_terms: Vec::new(),
+            }],
+            segments: vec![MediaSegment {
+                id: format!("segment-{sequence}"),
+                sequence,
+                path: std::path::PathBuf::from(format!("segment-{sequence}.ts")),
+                started_at_utc: at,
+                ended_at_utc: at + chrono::Duration::seconds(3),
+                duration_ms: 3_000,
+                size_bytes: 1,
+            }],
+        };
+        let mut pending = Some(ready(4));
+        let enqueue = begin_ready_dispatch_enqueue(&mut pending, ready(8));
+        let superseded = enqueue.superseded.as_ref().unwrap();
+
+        assert_eq!(superseded.source_sequences().collect::<Vec<_>>(), vec![4]);
+        assert!(pending.is_none());
+        enqueue.commit(&mut pending);
+        assert_eq!(
+            pending
+                .as_ref()
+                .unwrap()
+                .source_sequences()
+                .collect::<Vec<_>>(),
+            vec![8]
+        );
+    }
+
+    #[test]
+    fn blocker_event_batch_with_no_active_call_keeps_only_newest_dispatch_and_releases_older() {
+        let at = Utc.with_ymd_and_hms(2026, 8, 11, 5, 0, 0).single().unwrap();
+        let ready = |sequence| ReadyDispatch {
+            sequence,
+            clips: vec![RetainedClip {
+                sequence,
+                start_ms: at.timestamp_millis(),
+                duration_ms: 3_000,
+                text: format!("segment {sequence}"),
+                must_terms: Vec::new(),
+            }],
+            segments: vec![MediaSegment {
+                id: format!("segment-{sequence}"),
+                sequence,
+                path: std::path::PathBuf::from(format!("segment-{sequence}.ts")),
+                started_at_utc: at,
+                ended_at_utc: at + chrono::Duration::seconds(3),
+                duration_ms: 3_000,
+                size_bytes: 1,
+            }],
+        };
+        let mut pending: Option<ReadyDispatch> = None;
+
+        let mut released = Vec::new();
+        for incoming in [ready(12), ready(16)] {
+            let mut enqueue = begin_ready_dispatch_enqueue(&mut pending, incoming);
+            if let Some(stale) = enqueue.superseded.take() {
+                assert!(pending.is_none(), "release happens before replacement");
+                released.push(stale);
+            }
+            enqueue.commit(&mut pending);
+        }
+
+        assert_eq!(
+            released
+                .iter()
+                .flat_map(ReadyDispatch::source_sequences)
+                .collect::<Vec<_>>(),
+            vec![12]
+        );
+        assert_eq!(
+            pending
+                .as_ref()
+                .unwrap()
+                .source_sequences()
+                .collect::<Vec<_>>(),
+            vec![16]
+        );
+    }
+
+    #[test]
+    fn ready_dispatch_preserves_nonconsecutive_source_segments_without_early_ack_transfer() {
+        let at = Utc.with_ymd_and_hms(2026, 8, 11, 5, 0, 0).single().unwrap();
+        let mut available = BTreeMap::new();
+        for sequence in [1_u64, 4, 5, 6] {
+            available.insert(
+                sequence,
+                MediaSegment {
+                    id: format!("segment-{sequence}"),
+                    sequence,
+                    path: std::path::PathBuf::from(format!("segment-{sequence}.ts")),
+                    started_at_utc: at + chrono::Duration::seconds((sequence * 3) as i64),
+                    ended_at_utc: at + chrono::Duration::seconds(((sequence + 1) * 3) as i64),
+                    duration_ms: 3_000,
+                    size_bytes: 1,
+                },
+            );
+        }
+        let clips = [1_u64, 4, 5, 6]
+            .into_iter()
+            .map(|sequence| RetainedClip {
+                sequence,
+                start_ms: at.timestamp_millis() + (sequence as i64 * 3_000),
+                duration_ms: 3_000,
+                text: format!("segment {sequence}"),
+                must_terms: Vec::new(),
+            })
+            .collect();
+        let dispatch = take_ready_dispatch(clips, &mut available).unwrap();
+
+        assert!(available.is_empty());
+        assert_eq!(
+            dispatch.source_sequences().collect::<Vec<_>>(),
+            vec![1, 4, 5, 6]
+        );
+        assert!(dispatch.segments.iter().all(|segment| {
+            segment
+                .path
+                .extension()
+                .is_some_and(|extension| extension == "ts")
+        }));
     }
 
     #[test]
@@ -3491,7 +4268,7 @@ mod tests {
             updated_at: clip_end + chrono::Duration::seconds(3),
             source_window_sequence: 12,
             source_clip_ended_at: clip_end,
-            rolling_context: gemini::RollingContext::default(),
+            rolling_context: analysis::RollingContext::default(),
         };
         assert!(stream_context_envelope_matches(
             &envelope,
@@ -3524,24 +4301,51 @@ mod tests {
     }
 
     #[test]
+    fn context_envelope_commit_timestamp_never_predates_a_live_edge_clip_end() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 11, 5, 0, 0).single().unwrap();
+        let clip_end = now + chrono::Duration::seconds(3);
+        let envelope = StreamContextEnvelope::for_analysis(
+            "https://www.youtube.com/watch?v=test".to_owned(),
+            12,
+            clip_end,
+            analysis::RollingContext::default(),
+            now,
+        );
+
+        assert_eq!(envelope.updated_at, clip_end);
+        assert!(stream_context_envelope_matches(
+            &envelope,
+            "https://www.youtube.com/watch?v=test",
+            "2026-08-11",
+        ));
+    }
+
+    #[test]
     fn executable_actions_require_current_window_evidence_and_a_fresh_clip() {
         let received_at = Utc
             .with_ymd_and_hms(2026, 8, 11, 5, 0, 30)
             .single()
             .unwrap();
         let ended_at = received_at - chrono::Duration::seconds(5);
-        let started_at = ended_at - chrono::Duration::seconds(WINDOW_SECONDS as i64);
-        let window = MediaWindow {
-            id: "test-window".to_owned(),
+        let started_at = ended_at - chrono::Duration::seconds(3);
+        let dispatch = ReadyDispatch {
             sequence: 1,
-            path: std::path::PathBuf::from("test.mp4"),
-            segments: Vec::new(),
-            started_at_utc: started_at,
-            ended_at_utc: ended_at,
-            created_at_utc: ended_at,
-            duration_ms: WINDOW_SECONDS * 1_000,
-            size_bytes: 1,
-            inline_upload_safe: true,
+            clips: vec![RetainedClip {
+                sequence: 1,
+                start_ms: started_at.timestamp_millis(),
+                duration_ms: 3_000,
+                text: "enter now".to_owned(),
+                must_terms: vec!["entry".to_owned()],
+            }],
+            segments: vec![MediaSegment {
+                id: "test-segment".to_owned(),
+                sequence: 1,
+                path: std::path::PathBuf::from("test.ts"),
+                started_at_utc: started_at,
+                ended_at_utc: ended_at,
+                duration_ms: 3_000,
+                size_bytes: 1,
+            }],
         };
         let input = AnalysisInput {
             clip: ClipWindow {
@@ -3556,12 +4360,14 @@ mod tests {
             open_trades: Vec::new(),
             rolling_context: None,
         };
-        let completed = GeminiCompleted {
-            window,
+        let completed = AnalysisCompleted {
+            dispatch,
             input,
             transcript_excerpt: String::new(),
-            observed_candidate_ids: HashSet::new(),
             latency_ms: 1,
+            visual_sent: false,
+            visual_note: None,
+            recovery_image: None,
             result: Err("unused".to_owned()),
         };
         let mut action = TradeAction {
@@ -3571,11 +4377,10 @@ mod tests {
             trade_id: None,
             contract: None,
             levels: None,
-            confidence_pct: 80,
-            evidence_timestamps: vec![gemini::EvidenceTimestamp {
+            evidence_timestamps: vec![analysis::EvidenceTimestamp {
                 seconds_from_clip_start: 7.0,
-                source: gemini::EvidenceSource::Both,
-                transcript_chunk: Some(1),
+                source: analysis::EvidenceSource::Both,
+                source_segment_sequence: Some(1),
                 detail: None,
             }],
             rationale: "current entry call".to_owned(),
@@ -3588,12 +4393,14 @@ mod tests {
                 .unwrap()
                 .contains("no evidence")
         );
-        action.evidence_timestamps.push(gemini::EvidenceTimestamp {
-            seconds_from_clip_start: 7.0,
-            source: gemini::EvidenceSource::Both,
-            transcript_chunk: Some(1),
-            detail: None,
-        });
+        action
+            .evidence_timestamps
+            .push(analysis::EvidenceTimestamp {
+                seconds_from_clip_start: 7.0,
+                source: analysis::EvidenceSource::Both,
+                source_segment_sequence: Some(1),
+                detail: None,
+            });
         let stale_now = ended_at + chrono::Duration::milliseconds(MAX_EXECUTABLE_SIGNAL_AGE_MS + 1);
         assert!(
             executable_action_freshness_issue(&action, &completed, stale_now)
@@ -3609,5 +4416,83 @@ mod tests {
         );
         action.action = ActionKind::Hold;
         assert!(executable_action_freshness_issue(&action, &completed, stale_now).is_none());
+    }
+
+    #[test]
+    fn failed_broker_checkpoint_keeps_entry_context_unconsumed_for_retry() {
+        let mut provisional = analysis::RollingContext::default();
+        provisional.episodes.push(analysis::TradeEpisodeContext {
+            episode_id: "episode-1".to_owned(),
+            contract: None,
+            status: analysis::TradeEpisodeStatus::ConditionalEntry,
+            levels: None,
+            latest_instruction: "entry if confirmed".to_owned(),
+            entry_event_id: None,
+            first_seen_at: String::new(),
+            last_updated_at: String::new(),
+        });
+        let mut applied = provisional.clone();
+        applied.episodes[0].status = analysis::TradeEpisodeStatus::EntryCalled;
+        applied.episodes[0].entry_event_id = Some("event-1".to_owned());
+
+        let recovered = context_after_broker_checkpoint(provisional.clone(), applied, false);
+        assert_eq!(recovered, provisional);
+        assert_eq!(
+            recovered.episodes[0].status,
+            analysis::TradeEpisodeStatus::ConditionalEntry
+        );
+    }
+
+    #[test]
+    fn newest_durable_checkpoint_preserves_newer_local_and_accepts_newer_neon() {
+        #[derive(Clone)]
+        struct Checkpoint {
+            label: &'static str,
+            updated_at: DateTime<Utc>,
+        }
+        let older = Utc.with_ymd_and_hms(2026, 8, 15, 3, 0, 0).single().unwrap();
+        let newer = older + chrono::Duration::seconds(1);
+        let local = Checkpoint {
+            label: "local-order",
+            updated_at: newer,
+        };
+        let neon = Checkpoint {
+            label: "neon-old",
+            updated_at: older,
+        };
+        let (source, selected) =
+            select_newest_durable_state(Some(local), Some(neon), |state| state.updated_at).unwrap();
+        assert_eq!(source, DurableStateSource::Local);
+        assert_eq!(selected.label, "local-order");
+
+        let (source, selected) = select_newest_durable_state(
+            Some(Checkpoint {
+                label: "local-old",
+                updated_at: older,
+            }),
+            Some(Checkpoint {
+                label: "neon-new",
+                updated_at: newer,
+            }),
+            |state| state.updated_at,
+        )
+        .unwrap();
+        assert_eq!(source, DurableStateSource::Neon);
+        assert_eq!(selected.label, "neon-new");
+    }
+
+    #[test]
+    fn candidates_survive_rejected_placement_and_leave_only_after_actual_order() {
+        let instrument_id = "NIFTY-25000-CE";
+        let rejected = HashSet::new();
+        assert!(
+            !candidate_consumed_by_actual_placement(instrument_id, &rejected),
+            "routing/freshness/capital/duplicate/zero-order failures retain the watch"
+        );
+        let accepted = HashSet::from([instrument_id.to_owned()]);
+        assert!(candidate_consumed_by_actual_placement(
+            instrument_id,
+            &accepted
+        ));
     }
 }

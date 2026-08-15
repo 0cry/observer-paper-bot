@@ -22,13 +22,13 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Json as AxumJson, Path as AxumPath, Query, State},
     http::{HeaderValue, StatusCode, Uri, header},
     response::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::get,
+    routing::{get, patch, post},
 };
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use chrono_tz::Asia::Kolkata;
@@ -38,6 +38,8 @@ use tokio::{
     net::TcpListener,
     sync::{RwLock, broadcast},
 };
+
+use crate::{analysis::RuntimeKeyVault, cron_jobs, neon::NeonStore};
 
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8787;
 pub const MAX_RECENT_SIGNALS: usize = 500;
@@ -106,7 +108,10 @@ pub struct SessionView {
     pub clip_age_ms: Option<u64>,
     pub transcript_segments_ready: usize,
     pub transcription_latency_ms: Option<u64>,
-    pub gemini_latency_ms: Option<u64>,
+    pub analysis_latency_ms: Option<u64>,
+    /// Sanitized sparse-frame cadence only; raw images are never retained.
+    pub visual_status: Option<String>,
+    pub last_visual_at: Option<String>,
     pub last_prompt_at: Option<String>,
     pub last_tick_at: Option<String>,
     pub tick_age_ms: Option<u64>,
@@ -119,7 +124,7 @@ pub struct HealthView {
     #[serde(rename = "stream", alias = "stream_capture")]
     pub stream_capture: ComponentHealth,
     pub transcription: ComponentHealth,
-    pub gemini: ComponentHealth,
+    pub analysis: ComponentHealth,
     pub market_feed: ComponentHealth,
     pub persistence: ComponentHealth,
     /// Sanitized slot state only. Credential values and fragments are never exposed.
@@ -138,6 +143,18 @@ pub struct ApiKeyHealthView {
     pub failures: u64,
     pub cooldown_remaining_ms: u64,
     pub last_failure: Option<String>,
+    pub request_limit: Option<u64>,
+    pub request_remaining: Option<u64>,
+    pub request_reset_ms: Option<u64>,
+    pub token_limit: Option<u64>,
+    pub token_remaining: Option<u64>,
+    pub token_reset_ms: Option<u64>,
+    pub retry_after_ms: Option<u64>,
+    pub observed_day_ist: Option<String>,
+    pub observed_daily_requests: u64,
+    pub observed_daily_input_tokens: u64,
+    pub observed_daily_output_tokens: u64,
+    pub observed_daily_total_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -261,7 +278,6 @@ pub struct PendingOrderView {
     #[serde(rename = "ltp", alias = "current_ltp")]
     pub current_ltp: Option<f64>,
     pub reserved_cash: f64,
-    pub confidence_pct: f64,
     pub status: String,
     pub created_at: String,
     pub expires_at: Option<String>,
@@ -290,7 +306,6 @@ pub struct SignalView {
     pub stop_loss: Option<f64>,
     pub target_1: Option<f64>,
     pub target_2: Option<f64>,
-    pub confidence_pct: f64,
     pub market_bias: String,
     pub source_age_ms: Option<u64>,
     pub freshness: String,
@@ -344,7 +359,6 @@ pub struct HistoryTrade {
     pub charges: f64,
     pub net_pnl: f64,
     pub return_pct: f64,
-    pub confidence_pct: f64,
     pub max_favorable_price: f64,
     pub max_adverse_price: f64,
     pub notes: String,
@@ -365,6 +379,8 @@ pub struct DashboardHandle {
     events: broadcast::Sender<DashboardEvent>,
     server_started: Instant,
     sse_clients: Arc<AtomicUsize>,
+    openai_vault: Arc<RuntimeKeyVault>,
+    cron_store: Option<NeonStore>,
 }
 
 impl DashboardHandle {
@@ -379,6 +395,8 @@ impl DashboardHandle {
             events,
             server_started: Instant::now(),
             sse_clients: Arc::new(AtomicUsize::new(0)),
+            openai_vault: Arc::new(RuntimeKeyVault::empty()),
+            cron_store: None,
         }
     }
 
@@ -390,6 +408,23 @@ impl DashboardHandle {
     /// read. Prefer [`Self::update`] for mutations so SSE clients are notified.
     pub fn shared_state(&self) -> Arc<RwLock<DashboardState>> {
         Arc::clone(&self.state)
+    }
+
+    /// The only application owner of runtime-supplied OpenAI keys. The vault
+    /// is process-local and exposes no method to read raw credentials.
+    pub fn openai_vault(&self) -> Arc<RuntimeKeyVault> {
+        Arc::clone(&self.openai_vault)
+    }
+
+    pub fn with_cron_store(mut self, store: Option<NeonStore>) -> Self {
+        self.cron_store = store;
+        self
+    }
+
+    fn cron_store(&self) -> Result<NeonStore, StatusCode> {
+        self.cron_store
+            .clone()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)
     }
 
     pub async fn snapshot(&self) -> DashboardState {
@@ -591,8 +626,195 @@ pub fn router(handle: DashboardHandle) -> Router {
         .route("/api/history", get(api_history))
         .route("/api/events", get(api_events))
         .route("/api/export.csv", get(api_export_csv))
+        .route("/api/llm/keys", post(api_add_llm_keys))
+        .route("/api/llm/keys/clear", post(api_clear_llm_keys))
+        .route("/api/llm/keys/health", get(api_llm_key_health))
+        .route(
+            "/api/cron/jobs",
+            get(api_list_cron_jobs).post(api_create_cron_job),
+        )
+        .route(
+            "/api/cron/jobs/{id}",
+            patch(api_set_cron_job).delete(api_delete_cron_job),
+        )
+        .route("/api/cron/jobs/{id}/runs", get(api_list_cron_runs))
         .fallback(get(static_asset))
+        // The only credential-bearing request is a maximum of three runtime
+        // keys; a small body cap prevents accidental bulk submission.
+        .layer(DefaultBodyLimit::max(4_096))
         .with_state(handle)
+}
+
+const MAX_RUNTIME_KEY_SLOTS: usize = 3;
+
+#[derive(Debug, Deserialize)]
+struct AddLlmKeysRequest {
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LlmKeysWriteResponse {
+    accepted_slots: usize,
+    loaded_slots: usize,
+    state: crate::analysis::VaultState,
+}
+
+async fn api_add_llm_keys(
+    State(handle): State<DashboardHandle>,
+    AxumJson(request): AxumJson<AddLlmKeysRequest>,
+) -> Result<Json<LlmKeysWriteResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if request.keys.is_empty() || request.keys.len() > MAX_RUNTIME_KEY_SLOTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"submit between one and three keys"})),
+        ));
+    }
+    let vault = handle.openai_vault();
+    let accepted_slots = vault.add(request.keys).await.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"submitted key material was rejected"})),
+        )
+    })?;
+    let health = vault.health().await;
+    let loaded_slots = health.loaded_slots;
+    handle
+        .update("llm_keys_changed", None, |state| {
+            state.health.analysis = ComponentHealth {
+                status: "READY".to_owned(),
+                message: format!("{loaded_slots} runtime OpenAI key slot(s) loaded"),
+                ..ComponentHealth::default()
+            };
+        })
+        .await;
+    Ok(Json(LlmKeysWriteResponse {
+        accepted_slots,
+        loaded_slots: health.loaded_slots,
+        state: health.state,
+    }))
+}
+
+async fn api_clear_llm_keys(State(handle): State<DashboardHandle>) -> Json<LlmKeysWriteResponse> {
+    let vault = handle.openai_vault();
+    vault.clear().await;
+    let health = vault.health().await;
+    handle
+        .update("llm_keys_cleared", None, |state| {
+            state.health.analysis = ComponentHealth {
+                status: "KEYS_REQUIRED".to_owned(),
+                message: "add up to three runtime OpenAI keys in the dashboard".to_owned(),
+                ..ComponentHealth::default()
+            };
+        })
+        .await;
+    Json(LlmKeysWriteResponse {
+        accepted_slots: 0,
+        loaded_slots: health.loaded_slots,
+        state: health.state,
+    })
+}
+
+async fn api_llm_key_health(
+    State(handle): State<DashboardHandle>,
+) -> Json<crate::analysis::VaultHealth> {
+    Json(handle.openai_vault().health().await)
+}
+
+#[derive(Debug, Deserialize)]
+struct SetCronJobRequest {
+    enabled: bool,
+}
+
+async fn api_list_cron_jobs(
+    State(handle): State<DashboardHandle>,
+) -> Result<Json<Vec<cron_jobs::CronJobView>>, StatusCode> {
+    let rows = handle
+        .cron_store()?
+        .list_cron_jobs()
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(Json(
+        rows.into_iter().map(cron_jobs::row_to_public).collect(),
+    ))
+}
+
+async fn api_create_cron_job(
+    State(handle): State<DashboardHandle>,
+    AxumJson(request): AxumJson<cron_jobs::CreateCronJob>,
+) -> Result<(StatusCode, Json<cron_jobs::CronJobView>), (StatusCode, Json<serde_json::Value>)> {
+    let store = handle.cron_store().map_err(|status| {
+        (
+            status,
+            Json(serde_json::json!({"error":"cron storage unavailable"})),
+        )
+    })?;
+    let job = cron_jobs::validate_create(request, Utc::now()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"invalid cron job"})),
+        )
+    })?;
+    let row = store.create_cron_job(&job).await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"cron storage unavailable"})),
+        )
+    })?;
+    handle
+        .notify("cron_job_created", Some(row.id.to_string()))
+        .await;
+    Ok((StatusCode::CREATED, Json(cron_jobs::row_to_public(row))))
+}
+
+async fn api_set_cron_job(
+    State(handle): State<DashboardHandle>,
+    AxumPath(id): AxumPath<i64>,
+    AxumJson(request): AxumJson<SetCronJobRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let updated = handle
+        .cron_store()?
+        .set_cron_job_enabled(id, request.enabled)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if !updated {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    handle
+        .notify("cron_job_updated", Some(id.to_string()))
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_delete_cron_job(
+    State(handle): State<DashboardHandle>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<StatusCode, StatusCode> {
+    let deleted = handle
+        .cron_store()?
+        .delete_cron_job(id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if !deleted {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    handle
+        .notify("cron_job_deleted", Some(id.to_string()))
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_list_cron_runs(
+    State(handle): State<DashboardHandle>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<Vec<cron_jobs::CronRunView>>, StatusCode> {
+    let rows = handle
+        .cron_store()?
+        .list_cron_job_runs(id, 50)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(Json(
+        rows.into_iter().map(cron_jobs::run_to_public).collect(),
+    ))
 }
 
 pub async fn serve(handle: DashboardHandle, bind: SocketAddr) -> io::Result<()> {
@@ -800,6 +1022,7 @@ fn contains_secret_shape(lower: &str) -> bool {
         || lower.contains("gho_")
         || lower.contains("rnd_")
         || lower.contains("aiza")
+        || lower.contains("sk-")
         || lower.contains("sk_")
         || lower.contains("postgresql://")
         || lower.contains("postgres://")
@@ -826,8 +1049,6 @@ pub struct HistoryQuery {
     pub to: Option<String>,
     pub min_pnl: Option<f64>,
     pub max_pnl: Option<f64>,
-    pub min_confidence: Option<f64>,
-    pub max_confidence: Option<f64>,
     pub sort: Option<String>,
     pub order: Option<String>,
     pub page: Option<usize>,
@@ -975,16 +1196,6 @@ fn filtered_history(
         .filter(|trade| outcome_matches(trade, query.outcome.as_deref()))
         .filter(|trade| query.min_pnl.is_none_or(|value| trade.net_pnl >= value))
         .filter(|trade| query.max_pnl.is_none_or(|value| trade.net_pnl <= value))
-        .filter(|trade| {
-            query
-                .min_confidence
-                .is_none_or(|value| trade.confidence_pct >= value)
-        })
-        .filter(|trade| {
-            query
-                .max_confidence
-                .is_none_or(|value| trade.confidence_pct <= value)
-        })
         .filter(|trade| search_matches(trade, query.search.as_deref()))
         .filter(|trade| {
             if from.is_none() && to.is_none() {
@@ -1057,7 +1268,7 @@ fn strategy_filter(filter: &Option<String>, strategy: &str) -> bool {
 fn canonical_strategy(value: &str) -> String {
     let normalized = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
     match normalized.as_str() {
-        "llm" | "gemini" | "ai" | "llmexit" | "llm_exit" => "llm_exit".to_owned(),
+        "llm" | "analysis" | "ai" | "llmexit" | "llm_exit" => "llm_exit".to_owned(),
         "moving" | "trail" | "trailing" | "movingsl" | "moving_sl" | "rule" => {
             "moving_sl".to_owned()
         }
@@ -1169,7 +1380,6 @@ fn sort_history(
             "entry_price" => left.entry_price.total_cmp(&right.entry_price),
             "exit_price" => left.exit_price.total_cmp(&right.exit_price),
             "return_pct" => left.return_pct.total_cmp(&right.return_pct),
-            "confidence" | "confidence_pct" => left.confidence_pct.total_cmp(&right.confidence_pct),
             "hold_seconds" | "duration_seconds" => left.hold_seconds.cmp(&right.hold_seconds),
             "quantity" => left.quantity.cmp(&right.quantity),
             "symbol" | "contract" => left.symbol.to_lowercase().cmp(&right.symbol.to_lowercase()),
@@ -1205,8 +1415,6 @@ fn sort_history(
             | "entry_price"
             | "exit_price"
             | "return_pct"
-            | "confidence"
-            | "confidence_pct"
             | "hold_seconds"
             | "duration_seconds"
             | "quantity"
@@ -1323,7 +1531,6 @@ fn history_csv(history: &[HistoryTrade]) -> Result<Vec<u8>, ApiError> {
             "charges",
             "net_pnl",
             "return_pct",
-            "confidence_pct",
             "max_favorable_price",
             "max_adverse_price",
             "notes",
@@ -1364,7 +1571,6 @@ fn history_csv(history: &[HistoryTrade]) -> Result<Vec<u8>, ApiError> {
                 trade.charges.to_string(),
                 trade.net_pnl.to_string(),
                 trade.return_pct.to_string(),
-                trade.confidence_pct.to_string(),
                 trade.max_favorable_price.to_string(),
                 trade.max_adverse_price.to_string(),
                 csv_safe(&trade.notes),
@@ -1548,6 +1754,96 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn api_key_health_serializes_sanitized_rate_and_daily_usage_only() {
+        let view = ApiKeyHealthView {
+            provider: "OpenAI / Luna".to_owned(),
+            slot: 1,
+            status: "READY".to_owned(),
+            request_remaining: Some(299),
+            token_remaining: Some(400_000),
+            observed_day_ist: Some("2026-08-15".to_owned()),
+            observed_daily_requests: 12,
+            observed_daily_total_tokens: 42_000,
+            ..ApiKeyHealthView::default()
+        };
+        let value = serde_json::to_value(view).unwrap();
+        assert_eq!(value["request_remaining"], 299);
+        assert_eq!(value["token_remaining"], 400_000);
+        assert_eq!(value["observed_daily_requests"], 12);
+        assert!(value.get("api_key").is_none());
+        assert!(value.get("authorization").is_none());
+    }
+
+    #[test]
+    fn dashboard_rate_labels_state_their_data_provenance() {
+        let app = include_str!("../dashboard/app.js");
+        assert!(app.contains("server headers"));
+        assert!(app.contains("local IST observed"));
+    }
+
+    #[test]
+    fn dashboard_contains_runtime_key_and_cron_controls() {
+        let html = include_str!("../dashboard/index.html");
+        let app = include_str!("../dashboard/app.js");
+        for required in [
+            "cron-view",
+            "runtime-key-form",
+            "runtime-key-clear",
+            "runtime-key-health",
+            "cron-job-form",
+            "cron-jobs-body",
+        ] {
+            assert!(
+                html.contains(required),
+                "missing dashboard element: {required}"
+            );
+        }
+        for required in ["/api/llm/keys", "/api/cron/jobs", "loadCron", "renderCron"] {
+            assert!(
+                app.contains(required),
+                "missing dashboard behavior: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_uses_simple_service_status_and_two_approaches() {
+        let html = include_str!("../dashboard/index.html");
+        let app = include_str!("../dashboard/app.js");
+
+        assert!(!html.contains("session-started"));
+        assert!(!html.contains("last-updated"));
+        assert!(!html.contains("tick-age"));
+        assert!(!html.contains("value=\"all\""));
+        assert!(html.contains("Approach 1"));
+        assert!(html.contains("Approach 2"));
+        assert!(app.contains("hour12: true"));
+        assert!(app.contains("\"Online\" : \"Offline\""));
+        assert!(!app.contains("Market ${market}"));
+    }
+
+    #[test]
+    fn dashboard_chart_requires_complete_strategy_wallet_snapshots() {
+        let app = include_str!("../dashboard/app.js");
+        assert!(app.contains("completeStrategyCurve"));
+        assert!(app.contains("expectedAccountIds"));
+    }
+
+    #[test]
+    fn dashboard_resets_scroll_when_switching_views() {
+        let app = include_str!("../dashboard/app.js");
+        assert!(app.contains("window.scrollTo({ top: 0, left: 0"));
+    }
+
+    #[test]
+    fn dashboard_history_empty_state_uses_the_visible_panel_width() {
+        let app = include_str!("../dashboard/app.js");
+        let css = include_str!("../dashboard/styles.css");
+        assert!(app.contains("classList.toggle(\"is-empty\", !trades.length)"));
+        assert!(css.contains(".history-table.is-empty { min-width: 0; }"));
+    }
+
     fn trade(
         id: &str,
         account: &str,
@@ -1555,7 +1851,6 @@ mod tests {
         symbol: &str,
         closed_at: &str,
         pnl: f64,
-        confidence: f64,
     ) -> HistoryTrade {
         HistoryTrade {
             trade_id: id.to_owned(),
@@ -1577,7 +1872,6 @@ mod tests {
             gross_pnl: pnl + 40.0,
             charges: 40.0,
             return_pct: pnl / 100.0,
-            confidence_pct: confidence,
             hold_seconds: 120,
             ..HistoryTrade::default()
         }
@@ -1592,7 +1886,6 @@ mod tests {
                 "NIFTY-25000-CE",
                 "2026-08-11T05:00:00Z",
                 100.0,
-                72.0,
             ),
             trade(
                 "t2",
@@ -1601,7 +1894,6 @@ mod tests {
                 "SENSEX-80000-PE",
                 "2026-08-11T06:00:00Z",
                 -50.0,
-                80.0,
             ),
             trade(
                 "t3",
@@ -1610,7 +1902,6 @@ mod tests {
                 "NIFTY-25100-PE",
                 "2026-08-12T05:00:00Z",
                 200.0,
-                68.0,
             ),
             trade(
                 "t4",
@@ -1619,17 +1910,15 @@ mod tests {
                 "NIFTY-25200-CE",
                 "2026-08-12T06:00:00Z",
                 0.0,
-                66.0,
             ),
         ]
     }
 
     #[test]
-    fn history_filters_search_sorts_and_paginates() {
+    fn history_filters_search_sorts_and_paginates_without_score_filtering() {
         let query = HistoryQuery {
             account: Some("5k".to_owned()),
             underlying: Some("nifty".to_owned()),
-            min_confidence: Some(67.0),
             sort: Some("net_pnl".to_owned()),
             order: Some("desc".to_owned()),
             page: Some(1),
@@ -1637,8 +1926,8 @@ mod tests {
             ..HistoryQuery::default()
         };
         let result = history_response(&sample_history(), &query).unwrap();
-        assert_eq!(result.total, 2);
-        assert_eq!(result.total_pages, 2);
+        assert_eq!(result.total, 3);
+        assert_eq!(result.total_pages, 3);
         assert_eq!(result.items[0].trade_id, "t3");
         assert_eq!(result.summary.wins, 2);
         assert_eq!(result.summary.net_pnl, 300.0);
@@ -1720,7 +2009,6 @@ mod tests {
             "NIFTY-25000-CE",
             "2026-08-11T05:00:00Z",
             100.0,
-            72.0,
         );
         item.notes = "=HYPERLINK(\"https://bad.invalid\")".to_owned();
         let bytes = history_csv(&[item]).unwrap();
@@ -1837,6 +2125,18 @@ mod tests {
     }
 
     #[test]
+    fn runtime_log_sanitizer_redacts_openai_standard_and_project_shapes() {
+        let standard = format!("sk-{}", "x".repeat(32));
+        let project = format!("sk-proj-{}", "y".repeat(32));
+        let sanitized = sanitize_log_message(&format!("failure {standard} then {project}"));
+
+        assert!(sanitized.contains("[REDACTED]"));
+        assert!(!sanitized.contains(&standard));
+        assert!(!sanitized.contains(&project));
+        assert!(!sanitized.contains("sk-"));
+    }
+
+    #[test]
     fn runtime_logs_response_filters_orders_and_validates_limit() {
         let logs = vec![
             RuntimeLogEntry {
@@ -1853,8 +2153,8 @@ mod tests {
                 occurred_at: "2026-08-11T10:01:00Z".to_owned(),
                 occurred_at_ist: "2026-08-11T15:31:00+05:30".to_owned(),
                 level: "ERROR".to_owned(),
-                component: "Gemini".to_owned(),
-                code: "GEMINI_FAILED".to_owned(),
+                component: "Analysis".to_owned(),
+                code: "ANALYSIS_FAILED".to_owned(),
                 message: "provider failed".to_owned(),
             },
             RuntimeLogEntry {
@@ -1862,15 +2162,15 @@ mod tests {
                 occurred_at: "2026-08-11T10:02:00Z".to_owned(),
                 occurred_at_ist: "2026-08-11T15:32:00+05:30".to_owned(),
                 level: "ERROR".to_owned(),
-                component: "gemini".to_owned(),
-                code: "GEMINI_RETRY".to_owned(),
+                component: "analysis".to_owned(),
+                code: "ANALYSIS_RETRY".to_owned(),
                 message: "retrying".to_owned(),
             },
         ];
         let query = RuntimeLogQuery {
             limit: Some(2),
             level: Some("error".to_owned()),
-            component: Some("GEMINI".to_owned()),
+            component: Some("analysis".to_owned()),
         };
         let response = runtime_logs_response(&logs, &query).unwrap();
 
@@ -1894,6 +2194,40 @@ mod tests {
         assert_eq!(
             runtime_logs_response(&logs, &too_large).unwrap_err().status,
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_key_routes_are_write_only_and_clear_all_slots() {
+        let handle = DashboardHandle::empty();
+        let added = api_add_llm_keys(
+            State(handle.clone()),
+            AxumJson(AddLlmKeysRequest {
+                keys: vec![
+                    "route-test-key-one".to_owned(),
+                    "route-test-key-two".to_owned(),
+                ],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let serialized = serde_json::to_string(&added).unwrap();
+        assert_eq!(added.loaded_slots, 2);
+        assert!(!serialized.contains("route-test-key-one"));
+        assert!(
+            !serde_json::to_string(&api_llm_key_health(State(handle.clone())).await.0)
+                .unwrap()
+                .contains("route-test-key-one")
+        );
+        assert_eq!(handle.snapshot().await.health.analysis.status, "READY");
+
+        let cleared = api_clear_llm_keys(State(handle.clone())).await.0;
+        assert_eq!(cleared.loaded_slots, 0);
+        assert_eq!(cleared.state, crate::analysis::VaultState::KeysRequired);
+        assert_eq!(
+            handle.snapshot().await.health.analysis.status,
+            "KEYS_REQUIRED"
         );
     }
 }

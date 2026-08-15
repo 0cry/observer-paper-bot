@@ -1,12 +1,15 @@
+mod analysis;
+mod blocker;
 mod capture;
 mod config;
+mod cron_jobs;
 mod dashboard;
-mod gemini;
 mod market_feed;
 mod neon;
 mod paper;
 mod paper_runtime;
 mod persistence;
+mod recovery_buffer;
 mod runtime_logs;
 mod scheduler;
 mod stt;
@@ -1062,8 +1065,7 @@ async fn main() -> Result<()> {
             let store = neon::NeonStore::connect(database_url.expose_secret()).await?;
             store.ping().await?;
             println!(
-                "Configuration ready: {} Gemini slot(s), {} ElevenLabs slot(s), Neon healthy, channel configured: {}.",
-                config.gemini.api_keys.len(),
+                "Configuration ready: runtime OpenAI keys are dashboard-supplied only, {} ElevenLabs slot(s), Neon healthy, channel configured: {}.",
                 config.elevenlabs.api_keys.len(),
                 config.scheduler.youtube_channel_url.is_some(),
             );

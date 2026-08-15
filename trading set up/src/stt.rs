@@ -4,7 +4,7 @@
 //! It never emits log records, provider response bodies, or key material.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
@@ -15,7 +15,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use futures_util::future::join_all;
 use reqwest::{
     Client, StatusCode,
     header::{CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER},
@@ -26,8 +25,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-pub const SEGMENT_SECONDS: f64 = 4.0;
-pub const WINDOW_CHUNKS: usize = 2;
+pub const SEGMENT_SECONDS: f64 = 3.0;
 pub const DEFAULT_STT_CONCURRENCY: usize = 4;
 
 const ELEVENLABS_STT_ENDPOINT: &str = "https://api.elevenlabs.io/v1/speech-to-text";
@@ -37,7 +35,7 @@ const TIMELINE_EPSILON_SECONDS: f64 = 0.001;
 
 static MULTIPART_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// One exact four-second input cut from the shared stream clock.
+/// One exact three-second input cut from the shared stream clock.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SegmentInput {
     pub index: u64,
@@ -91,7 +89,7 @@ pub enum TranscriptFailure {
 }
 
 /// A timestamped provider token. Times are absolute on the stream timeline,
-/// not relative to the four-second file.
+/// not relative to the three-second file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WordTimestamp {
     pub text: String,
@@ -129,33 +127,6 @@ impl TranscriptChunk {
             language_code: None,
         }
     }
-
-    #[cfg(test)]
-    fn test_complete(segment: &SegmentInput, text: &str) -> Self {
-        Self {
-            index: segment.index,
-            start_sec: segment.start_sec,
-            end_sec: segment.end_sec,
-            status: TranscriptStatus::Complete,
-            failure: None,
-            text: text.to_owned(),
-            word_timestamps: Vec::new(),
-            speakers: Vec::new(),
-            language_code: Some("en".to_owned()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TranscriptWindow {
-    pub first_chunk_index: u64,
-    pub start_sec: f64,
-    pub end_sec: f64,
-    pub complete: bool,
-    pub incomplete_count: usize,
-    pub text: String,
-    pub speakers: Vec<String>,
-    pub chunks: Vec<TranscriptChunk>,
 }
 
 #[derive(Debug, Clone)]
@@ -460,7 +431,7 @@ impl ElevenLabsSttClient {
             .collect()
     }
 
-    /// Transcribe one declared four-second segment. Operational failures are
+    /// Transcribe one declared three-second segment. Operational failures are
     /// returned as an incomplete chunk so downstream window construction never
     /// waits indefinitely or loses the segment's timeline position.
     pub async fn transcribe_segment(&self, segment: SegmentInput) -> TranscriptChunk {
@@ -477,37 +448,6 @@ impl ElevenLabsSttClient {
             Ok(chunk) => chunk,
             Err(_) => TranscriptChunk::incomplete(&segment, TranscriptFailure::TimedOut),
         }
-    }
-
-    /// Transcribe an 8-second window as two exact, consecutive four-second
-    /// chunks. Both requests run concurrently (subject to the global
-    /// semaphore), and the returned chunks are always in chronological order.
-    pub async fn transcribe_window(
-        &self,
-        mut segments: [SegmentInput; WINDOW_CHUNKS],
-    ) -> TranscriptWindow {
-        segments.sort_by(|left, right| {
-            left.index
-                .cmp(&right.index)
-                .then_with(|| left.start_sec.total_cmp(&right.start_sec))
-        });
-
-        if !valid_window_layout(&segments) {
-            let chunks = segments
-                .iter()
-                .map(|segment| {
-                    TranscriptChunk::incomplete(segment, TranscriptFailure::InvalidWindow)
-                })
-                .collect();
-            return assemble_window(&segments, chunks);
-        }
-
-        let tasks = segments
-            .iter()
-            .cloned()
-            .map(|segment| self.transcribe_segment(segment));
-        let chunks = join_all(tasks).await;
-        assemble_window(&segments, chunks)
     }
 
     async fn transcribe_segment_inner(&self, segment: &SegmentInput) -> TranscriptChunk {
@@ -773,64 +713,6 @@ fn absolute_provider_time(segment: &SegmentInput, value: Option<f64>) -> Option<
         .map(|time| segment.start_sec + time.clamp(0.0, segment.end_sec - segment.start_sec))
 }
 
-fn valid_window_layout(segments: &[SegmentInput; WINDOW_CHUNKS]) -> bool {
-    if !segments.iter().all(SegmentInput::is_exact_segment) {
-        return false;
-    }
-
-    segments.windows(2).all(|pair| {
-        pair[1].index == pair[0].index + 1
-            && (pair[1].start_sec - pair[0].end_sec).abs() <= TIMELINE_EPSILON_SECONDS
-    })
-}
-
-fn assemble_window(
-    expected_segments: &[SegmentInput; WINDOW_CHUNKS],
-    completed_chunks: Vec<TranscriptChunk>,
-) -> TranscriptWindow {
-    let mut by_index = BTreeMap::new();
-    for chunk in completed_chunks {
-        by_index.entry(chunk.index).or_insert(chunk);
-    }
-
-    let chunks = expected_segments
-        .iter()
-        .map(|segment| {
-            by_index.remove(&segment.index).unwrap_or_else(|| {
-                TranscriptChunk::incomplete(segment, TranscriptFailure::MissingResult)
-            })
-        })
-        .collect::<Vec<_>>();
-    let incomplete_count = chunks
-        .iter()
-        .filter(|chunk| chunk.status == TranscriptStatus::Incomplete)
-        .count();
-    let text = chunks
-        .iter()
-        .map(|chunk| chunk.text.trim())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut speakers = Vec::new();
-    let mut seen_speakers = HashSet::new();
-    for speaker in chunks.iter().flat_map(|chunk| chunk.speakers.iter()) {
-        if seen_speakers.insert(speaker.clone()) {
-            speakers.push(speaker.clone());
-        }
-    }
-
-    TranscriptWindow {
-        first_chunk_index: expected_segments[0].index,
-        start_sec: expected_segments[0].start_sec,
-        end_sec: expected_segments[WINDOW_CHUNKS - 1].end_sec,
-        complete: incomplete_count == 0,
-        incomplete_count,
-        text,
-        speakers,
-        chunks,
-    }
-}
-
 fn parse_vault_keys(contents: &str) -> Vec<SecretKey> {
     let mut keys = Vec::new();
     let mut seen = HashSet::new();
@@ -932,7 +814,7 @@ fn media_type_for_extension(extension: &str) -> &'static str {
         "webm" => "audio/webm",
         "mp4" => "video/mp4",
         // FFmpeg's segment muxer writes MPEG-2 transport stream chunks.  Use
-        // the registered media type so Scribe receives the four-second `.ts`
+        // the registered media type so Scribe receives the five-second `.ts`
         // segment as media instead of an opaque binary upload.
         "ts" => "video/mp2t",
         "mov" => "video/quicktime",
@@ -956,12 +838,6 @@ mod tests {
     }
 
     #[test]
-    fn transcription_contract_is_two_four_second_chunks() {
-        assert_eq!(SEGMENT_SECONDS, 4.0);
-        assert_eq!(WINDOW_CHUNKS, 2);
-    }
-
-    #[test]
     fn parses_and_deduplicates_supported_key_shapes_without_exposable_debug() {
         let first = "sk_0123456789abcdefghijklmnop";
         let second = "0123456789ABCDEF0123456789ABCDEF";
@@ -975,31 +851,6 @@ mod tests {
         assert!(!debug.contains(first));
         assert!(!debug.contains(second));
         assert!(debug.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn assembles_window_in_order_and_marks_a_missing_chunk_incomplete() {
-        let expected = [segment(40), segment(41)];
-        let completed = vec![TranscriptChunk::test_complete(&expected[0], "one")];
-
-        let window = assemble_window(&expected, completed);
-
-        assert_eq!(
-            window
-                .chunks
-                .iter()
-                .map(|chunk| chunk.index)
-                .collect::<Vec<_>>(),
-            vec![40, 41]
-        );
-        assert_eq!(window.chunks[1].status, TranscriptStatus::Incomplete);
-        assert_eq!(
-            window.chunks[1].failure,
-            Some(TranscriptFailure::MissingResult)
-        );
-        assert_eq!(window.incomplete_count, 1);
-        assert!(!window.complete);
-        assert_eq!(window.text, "one");
     }
 
     #[test]
@@ -1034,12 +885,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_window_requires_two_contiguous_four_second_chunks() {
-        let mut segments = [segment(0), segment(1)];
-        assert!(valid_window_layout(&segments));
+    fn segment_contract_is_exactly_three_seconds() {
+        let input = segment(0);
+        assert!(input.is_exact_segment());
 
-        segments[1].start_sec += 0.01;
-        segments[1].end_sec += 0.01;
-        assert!(!valid_window_layout(&segments));
+        let invalid = SegmentInput::new(0, 0.0, 5.0, "segment_0.wav");
+        assert!(!invalid.is_exact_segment());
     }
 }
