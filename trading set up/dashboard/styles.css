@@ -148,9 +148,8 @@ a:focus-visible {
 
 .source-status { margin-top: 30px; padding: 0 9px; }
 .source-status ul { display: grid; gap: 13px; margin: 0; padding: 0; list-style: none; }
-.source-status li { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-soft); font-size: 12px; }
+.source-status li { display: flex; align-items: center; gap: 8px; color: var(--text-soft); font-size: 12px; }
 .source-status li span { display: flex; align-items: center; min-width: 0; gap: 8px; }
-.source-status li b { overflow: hidden; color: var(--text-muted); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .api-key-health { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
 .api-key-health .sidebar-section-title { margin-bottom: 12px; }
 .source-status li.key-health-empty { color: var(--text-muted); font-size: 10px; }
@@ -370,6 +369,9 @@ td strong { color: var(--text); font-size: 11px; font-weight: 650; }
 .usage-bar i { display: block; height: 100%; border-radius: inherit; background: var(--blue); }
 
 .positions-panel { margin-top: 12px; }
+.positions-panel .table-scroll { overflow-x: hidden; }
+.positions-table { table-layout: fixed; }
+.positions-table th:first-child, .positions-table td:first-child { width: 30%; }
 .positions-table { min-width: 1040px; }
 .history-table { min-width: 1250px; }
 .history-table.is-empty { min-width: 0; }

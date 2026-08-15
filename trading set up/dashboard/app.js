@@ -486,7 +486,7 @@
   function renderPositions(data) {
     els["position-count"].textContent = `${data.positions.length} open`;
     if (!data.positions.length) {
-      els["positions-body"].innerHTML = emptyRow(10, "No live positions", "Accepted entries will appear here and update tick by tick.");
+      els["positions-body"].innerHTML = emptyRow(7, "No live positions", "Accepted entries will appear here and update tick by tick.");
       return;
     }
     els["positions-body"].innerHTML = data.positions.map((position) => {
@@ -495,8 +495,6 @@
       const entry = nullableNumber(pick(position, ["entry_price", "entry", "fill_price", "average_entry"]));
       const ltp = nullableNumber(pick(position, ["ltp", "current_price", "last_price", "mark_price"]));
       const sl = nullableNumber(pick(position, ["effective_sl", "stop_loss", "sl", "trailing_sl"]));
-      const t1 = nullableNumber(pick(position, ["t1", "target_1", "target1"]));
-      const t2 = nullableNumber(pick(position, ["t2", "target_2", "target2"]));
       const qty = nullableNumber(pick(position, ["quantity", "qty", "filled_quantity", "units"]));
       const pnl = firstDefined(nullableNumber(pick(position, ["pnl", "unrealized_pnl", "mtm"])), entry !== null && ltp !== null && qty !== null ? (ltp - entry) * qty : null);
       const explicitFresh = pick(position, ["tick_fresh", "fresh", "is_fresh"]);
@@ -504,8 +502,6 @@
       const fresh = explicitFresh === undefined
         ? (tickAge !== null ? tickAge <= 5_000 : Boolean(pick(position, ["last_tick_at"])))
         : boolean(explicitFresh, false);
-      const phase = cleanText(pick(position, ["phase", "trailing_phase", "risk_phase"]), "Phase 0");
-      const opened = pick(position, ["opened_at", "entry_at", "entry_time", "created_at"]);
       return `<tr>
         <td><strong>${escapeHtml(contract)}</strong><span class="secondary">${escapeHtml(account)}</span></td>
         <td>${modeBadge(pick(position, ["mode", "exit_mode", "strategy"]))}</td>
@@ -513,10 +509,7 @@
         <td class="numeric">${formatNumber(entry)}</td>
         <td class="numeric"><strong class="ltp-fresh ${fresh ? "" : "ltp-stale"}" title="${fresh ? "Fresh market tick" : "Stale or missing market tick"}">${formatNumber(ltp)}</strong></td>
         <td class="numeric">${formatNumber(sl)}</td>
-        <td class="numeric">${formatNumber(t1)} <span class="secondary">${t2 === null ? "No T2" : formatNumber(t2)}</span></td>
-        <td><span class="phase-badge">${escapeHtml(phase)}</span></td>
         <td class="numeric ${pnlClass(pnl)}"><strong>${formatMoney(pnl)}</strong></td>
-        <td><time title="${escapeHtml(formatDateTime(opened))}">${escapeHtml(relativeAge(opened))}</time></td>
       </tr>`;
     }).join("");
   }
@@ -1012,8 +1005,10 @@
     const dot = els[`${prefix}-dot`];
     const label = els[`${prefix}-label`];
     dot.className = `status-dot ${status.className}`;
-    label.textContent = status.label;
-    label.title = status.label;
+    if (label) {
+      label.textContent = status.label;
+      label.title = status.label;
+    }
   }
 
   function renderHealth() {
@@ -1022,10 +1017,6 @@
     setSourceStatus("stream", componentStatus("stream", ["video", "youtube"]));
     setSourceStatus("stt", componentStatus("stt", ["transcription", "elevenlabs"]));
     setSourceStatus("luna", componentStatus("analysis", ["llm", "ai"]));
-    if (els["visual-label"]) {
-      els["visual-label"].textContent = cleanText(app.state?.session?.visualStatus, "Waiting");
-      els["visual-label"].title = els["visual-label"].textContent;
-    }
     renderKeyHealth();
     renderConnection();
   }
