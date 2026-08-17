@@ -197,7 +197,7 @@ pub async fn run(project_dir: &Path, http: Client) -> Result<()> {
             storage_degraded,
         )
         .await;
-        match discover_live_url(&config.paths.yt_dlp_path, &channel_url).await {
+        match discover_live_url(&http, &config.paths.yt_dlp_path, &channel_url).await {
             Ok(Some(stream_url)) => {
                 runtime_logger
                     .record(
@@ -308,25 +308,58 @@ fn is_trading_day(date: NaiveDate, holidays: &[NaiveDate]) -> bool {
     !matches!(date.weekday(), Weekday::Sat | Weekday::Sun) && !holidays.contains(&date)
 }
 
-async fn discover_live_url(yt_dlp: &Path, channel_url: &str) -> Result<Option<String>> {
+async fn discover_live_url(
+    http: &Client,
+    yt_dlp: &Path,
+    channel_url: &str,
+) -> Result<Option<String>> {
     let live_page = format!("{}/live", channel_url.trim_end_matches('/'));
+
+    if let Ok(Ok(response)) = timeout(
+        Duration::from_secs(15),
+        http.get(&live_page)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (compatible; ObserverPaperBot/1.0)",
+            )
+            .header("Cache-Control", "no-cache")
+            .send(),
+    )
+    .await
+        && response.status().is_success()
+        && let Ok(bytes) = response.bytes().await
+        && bytes.len() <= 4 * 1024 * 1024
+        && let Some(stream_url) = parse_live_page(&String::from_utf8_lossy(&bytes))
+    {
+        return Ok(Some(stream_url));
+    }
+
     let mut command = Command::new(yt_dlp);
     command
         .arg("--no-warnings")
         .arg("--no-playlist")
         .arg("--skip-download")
+        .arg("--extractor-args")
+        .arg(youtube_player_client_fallback())
         .arg("--print")
         .arg("%(id)s\t%(live_status)s\t%(webpage_url)s")
         .arg(live_page)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     let output = timeout(Duration::from_secs(45), command.output())
         .await
         .context("yt-dlp discovery timed out")?
         .context("could not execute yt-dlp discovery")?;
     if !output.status.success() {
-        return Ok(None);
+        let detail = bounded_yt_dlp_failure_detail(&output.stderr);
+        if detail.is_empty() {
+            bail!("yt-dlp discovery exited with status {}", output.status);
+        }
+        bail!(
+            "yt-dlp discovery exited with status {}: {detail}",
+            output.status
+        );
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
@@ -336,6 +369,73 @@ async fn discover_live_url(yt_dlp: &Path, channel_url: &str) -> Result<Option<St
         }
     }
     Ok(None)
+}
+
+pub(crate) fn youtube_player_client_fallback() -> &'static str {
+    "youtube:player_client=android_vr"
+}
+
+/// Keeps resolver diagnostics useful without exposing signed URLs or terminal control text.
+pub(crate) fn bounded_yt_dlp_failure_detail(stderr: &[u8]) -> String {
+    let mut clean = String::new();
+    let mut in_escape = false;
+    let mut csi_escape = false;
+    for character in String::from_utf8_lossy(stderr).chars() {
+        if in_escape {
+            if !csi_escape && character == '[' {
+                csi_escape = true;
+                continue;
+            }
+            if (csi_escape && ('@'..='~').contains(&character))
+                || (!csi_escape && character.is_ascii_alphabetic())
+            {
+                in_escape = false;
+                csi_escape = false;
+            }
+            continue;
+        }
+        if character == '\u{1b}' {
+            in_escape = true;
+            csi_escape = false;
+        } else if character.is_ascii_graphic() || character.is_ascii_whitespace() {
+            clean.push(character);
+        }
+    }
+    let mut words = Vec::new();
+    let mut length = 0usize;
+    for word in clean.split_whitespace() {
+        let replacement = if word.starts_with("https://") || word.starts_with("http://") {
+            "[URL redacted]"
+        } else {
+            word
+        };
+        length += replacement.len() + usize::from(!words.is_empty());
+        words.push(replacement);
+        if length >= 480 {
+            break;
+        }
+    }
+    words.join(" ").chars().take(480).collect::<String>()
+}
+
+fn parse_live_page(html: &str) -> Option<String> {
+    let is_live = html.contains("itemprop=\"isLiveBroadcast\" content=\"True\"")
+        || html.contains("\"isLiveNow\":true")
+        || html.contains("\"liveStreamabilityRenderer\"");
+    if !is_live {
+        return None;
+    }
+
+    const CANONICAL: &str = "<link rel=\"canonical\" href=\"https://www.youtube.com/watch?v=";
+    let start = html.find(CANONICAL)? + CANONICAL.len();
+    let video_id = html.get(start..start + 11)?;
+    if !video_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(format!("https://www.youtube.com/watch?v={video_id}"))
 }
 
 fn waiting_state(
@@ -591,6 +691,40 @@ mod tests {
         assert_eq!(
             state.health.persistence.message,
             "durable paper state is unavailable; configured fallback wallets are displayed"
+        );
+    }
+
+    #[test]
+    fn live_page_fallback_extracts_only_an_active_youtube_broadcast() {
+        let html = r#"<link rel="canonical" href="https://www.youtube.com/watch?v=gLc-pEPGZjI">
+            <meta itemprop="isLiveBroadcast" content="True">"#;
+        assert_eq!(
+            parse_live_page(html),
+            Some("https://www.youtube.com/watch?v=gLc-pEPGZjI".to_owned())
+        );
+
+        let ended = r#"<link rel="canonical" href="https://www.youtube.com/watch?v=gLc-pEPGZjI">
+            <meta itemprop="isLiveBroadcast" content="False">"#;
+        assert_eq!(parse_live_page(ended), None);
+    }
+
+    #[test]
+    fn yt_dlp_failure_detail_is_bounded_and_redacts_urls() {
+        let detail = bounded_yt_dlp_failure_detail(
+            b"ERROR: Sign in to confirm you\x1b[31m are not a bot\nhttps://example.test/secret?token=abc",
+        );
+
+        assert_eq!(
+            detail,
+            "ERROR: Sign in to confirm you are not a bot [URL redacted]"
+        );
+    }
+
+    #[test]
+    fn youtube_client_fallback_uses_a_live_stream_compatible_client() {
+        assert_eq!(
+            youtube_player_client_fallback(),
+            "youtube:player_client=android_vr"
         );
     }
 }
