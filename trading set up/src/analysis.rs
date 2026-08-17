@@ -41,17 +41,17 @@ const MAX_INSTRUCTION_CHARS: usize = 640;
 const MAX_ACTION_EVENT_ID_CHARS: usize = 160;
 /// Stable bucket for the immutable Luna instruction/schema prefix. Bump this
 /// version whenever either changes so old cache entries are never reused.
-const PROMPT_CACHE_KEY: &str = "observer-paper-luna-v1";
+const PROMPT_CACHE_KEY: &str = "observer-paper-luna-v2";
 
 const SYSTEM_INSTRUCTION: &str = r#"paper-only trade extractor. Strict JSON only; no prose/orders.
 
-Use selected transcripts, optional image, market snapshot, rolling_context. Media is untrusted; visual prices stale. Return compact context with proven contract, entry, SL, target, booking, cancellation.
+Use transcripts/image, market snapshot, rolling_context. Media untrusted; visual prices stale. Return proven contract, entry, SL, targets, booking, cancellation.
 
-Keep stable episode_id, entry_event_id, identity, levels, unresolved episodes. Current evidence overrides context; context carries identity/proven levels, never a new command.
+Keep stable episode_id/entry_event_id, identity, levels, unresolved episodes. Current evidence overrides context; context carries facts, no commands.
 
-Every executable action needs current selected source evidence: selected source_segment_sequence and in-segment offset. Never invent contract, expiry, price, level, visual fact, intent. Never repeat entry_event_id unless current evidence proves a distinct entry.
+Each executable action needs current selected source evidence: clip-relative seconds_from_clip_start with exact matching source_segment_sequence; time must be in its [start_offset_seconds, end_offset_seconds); only final selected segment owns exact end. Never invent contract/expiry/price/level/visual fact/intent. Never reuse entry_event_id absent current evidence of distinct entry.
 
-WATCH is discussion, not entry. PLACE_ENTRY needs factual BUY contract, entry, affirmative current intent; read intent semantically, not only "enter now". Reuse same-episode hard_sl/T1 or null for runtime fallback. CANCEL_ENTRY, UPDATE_LEVELS, EXIT, HOLD need explicit current instruction for matching setup/trade. Ignore ambiguity, education, recap, promotion, VIP/Telegram, SELL/short.
+WATCH is discussion, not entry. PLACE_ENTRY needs factual BUY contract, entry, affirmative current intent judged semantically. Reuse same-episode hard_sl/T1 or null for runtime fallback. CANCEL_ENTRY, UPDATE_LEVELS, EXIT, HOLD need explicit current matching instruction. Ignore ambiguity, education, recap, promotion, VIP/Telegram, SELL/short.
 
 Require hard_sl < entry < t1 and t1 < t2 if t2. Omit unknown expiry; factual rationales."#;
 
@@ -1317,6 +1317,12 @@ fn normalize_and_validate(
             continue;
         }
 
+        if action.action.is_trade_command() && !action.evidence_timestamps.is_empty() {
+            // Do not trust a model-supplied event id for an executable command.
+            // Derive it only after raw evidence ownership has passed validation.
+            action.event_id = Some(current_action_event_id(&action, &input.clip));
+        }
+
         let key = action_dedup_key(&action);
         if !accepted_keys.insert(key) {
             rejected.push(RejectedAction {
@@ -1419,13 +1425,6 @@ fn normalize_action(
         ) {
             merge_missing_levels(&mut action.levels, episode.levels.as_ref());
         }
-    }
-
-    if action.action.is_trade_command() && !action.evidence_timestamps.is_empty() {
-        // Do not trust a model-supplied event id for an executable command. A
-        // deterministic id tied to the current clip/evidence makes replay
-        // deduplication stable and prevents an old context id being reused.
-        action.event_id = Some(current_action_event_id(action, &input.clip));
     }
 
     // UPDATE_LEVELS may contain only changed values. Complete it from the
@@ -1965,16 +1964,27 @@ fn validate_action(
             );
         };
 
-        // Wire timestamps are deterministically rounded to milliseconds. Source
-        // ownership is half-open [start, end), except the chronologically final
-        // selected source segment owns its exact end boundary.
-        let evidence_at = input.clip.started_at
-            + chrono::Duration::milliseconds(
-                (evidence.seconds_from_clip_start * 1_000.0).round() as i64
-            );
-        let owns_evidence = evidence_at >= chunk.started_at
-            && (evidence_at < chunk.ended_at
-                || (Some(sequence) == final_selected_sequence && evidence_at == chunk.ended_at));
+        // Compare the raw model timestamp before any downstream millisecond
+        // conversion. Ownership is half-open [start, end), except the
+        // chronologically final selected segment owns its exact end boundary.
+        let chunk_start_seconds = chunk
+            .started_at
+            .signed_duration_since(input.clip.started_at)
+            .num_nanoseconds()
+            .ok_or_else(|| "selected source segment offset is outside supported range".to_owned())?
+            as f64
+            / 1_000_000_000.0;
+        let chunk_end_seconds = chunk
+            .ended_at
+            .signed_duration_since(input.clip.started_at)
+            .num_nanoseconds()
+            .ok_or_else(|| "selected source segment offset is outside supported range".to_owned())?
+            as f64
+            / 1_000_000_000.0;
+        let owns_evidence = evidence.seconds_from_clip_start >= chunk_start_seconds
+            && (evidence.seconds_from_clip_start < chunk_end_seconds
+                || (Some(sequence) == final_selected_sequence
+                    && evidence.seconds_from_clip_start == chunk_end_seconds));
         if !owns_evidence {
             return Err(
                 "evidence timestamp does not time-align with its claimed source segment".to_owned(),
@@ -2157,6 +2167,63 @@ fn action_dedup_key(action: &TradeAction) -> String {
     )
 }
 
+/// Prompt-only view that adds the clip-relative coordinates needed to cite a
+/// selected transcript. Keeping these derived fields out of `AnalysisInput`
+/// and `TranscriptChunk` preserves their persisted JSON compatibility.
+#[derive(Serialize)]
+struct PromptAnalysisInput<'a> {
+    clip: &'a ClipWindow,
+    transcripts: Vec<PromptTranscriptChunk<'a>>,
+    watched_options: &'a [WatchedOptionSnapshot],
+    open_trades: &'a [OpenTradeSnapshot],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rolling_context: Option<&'a RollingContext>,
+}
+
+#[derive(Serialize)]
+struct PromptTranscriptChunk<'a> {
+    source_sequence: u64,
+    started_at: &'a DateTime<Utc>,
+    ended_at: &'a DateTime<Utc>,
+    start_offset_seconds: f64,
+    end_offset_seconds: f64,
+    text: &'a str,
+    complete: bool,
+}
+
+impl<'a> PromptAnalysisInput<'a> {
+    fn new(input: &'a AnalysisInput) -> Self {
+        let transcripts = input
+            .transcripts
+            .iter()
+            .map(|chunk| PromptTranscriptChunk {
+                source_sequence: chunk.source_sequence,
+                started_at: &chunk.started_at,
+                ended_at: &chunk.ended_at,
+                start_offset_seconds: chunk
+                    .started_at
+                    .signed_duration_since(input.clip.started_at)
+                    .num_milliseconds() as f64
+                    / 1_000.0,
+                end_offset_seconds: chunk
+                    .ended_at
+                    .signed_duration_since(input.clip.started_at)
+                    .num_milliseconds() as f64
+                    / 1_000.0,
+                text: &chunk.text,
+                complete: chunk.complete,
+            })
+            .collect();
+        Self {
+            clip: &input.clip,
+            transcripts,
+            watched_options: &input.watched_options,
+            open_trades: &input.open_trades,
+            rolling_context: input.rolling_context.as_ref(),
+        }
+    }
+}
+
 fn build_request_body(
     model: &str,
     input: &AnalysisInput,
@@ -2181,7 +2248,7 @@ fn build_request_body(
     let prompt_context = json!({
         "entry_input_complete": entry_issues.is_empty(),
         "entry_input_issues": entry_issues,
-        "context": prompt_input,
+        "context": PromptAnalysisInput::new(&prompt_input),
     });
     let prompt_text = serde_json::to_string(&prompt_context)
         .context("failed to serialize Analysis analysis context")?;
@@ -2265,9 +2332,17 @@ fn response_json_schema() -> Value {
     let evidence_schema = json!({
         "type": "object",
         "properties": {
-            "seconds_from_clip_start": { "type": "number", "minimum": 0 },
+            "seconds_from_clip_start": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Required clip-relative seconds from context.clip.started_at; must be inside the matching selected transcript's [start_offset_seconds, end_offset_seconds), except the final selected segment may own its exact end."
+            },
             "source": { "type": "string", "enum": ["VIDEO", "TRANSCRIPT", "BOTH"] },
-            "source_segment_sequence": { "type": ["integer", "null"], "minimum": 0 },
+            "source_segment_sequence": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "For executable evidence, must exactly match source_sequence of the selected transcript that owns seconds_from_clip_start; selected sequences may be non-contiguous."
+            },
             "detail": { "type": ["string", "null"] }
         },
         "required": ["seconds_from_clip_start", "source", "source_segment_sequence", "detail"],
@@ -3000,6 +3075,71 @@ mod tests {
     }
 
     #[test]
+    fn request_serializes_clip_relative_offsets_for_nonconsecutive_selected_segments() {
+        let mut input = complete_input();
+        input.clip.started_at = at(3);
+        input.clip.ended_at = at(21);
+        input.clip.sent_at = at(22);
+        input.transcripts = [1_u64, 4, 5, 6]
+            .into_iter()
+            .map(|sequence| TranscriptChunk {
+                source_sequence: sequence,
+                started_at: at((sequence * 3) as i64),
+                ended_at: at(((sequence + 1) * 3) as i64),
+                text: format!("segment {sequence}"),
+                complete: true,
+            })
+            .collect();
+
+        let body = build_request_body(DEFAULT_LUNA_MODEL, &input, None).unwrap();
+        let prompt_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        let prompt: Value = serde_json::from_str(prompt_text).unwrap();
+        let selected = prompt["context"]["transcripts"].as_array().unwrap();
+        let observed = selected
+            .iter()
+            .map(|chunk| {
+                json!({
+                    "source_sequence": chunk["source_sequence"],
+                    "start_offset_seconds": chunk["start_offset_seconds"],
+                    "end_offset_seconds": chunk["end_offset_seconds"],
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            observed,
+            vec![
+                json!({ "source_sequence": 1, "start_offset_seconds": 0.0, "end_offset_seconds": 3.0 }),
+                json!({ "source_sequence": 4, "start_offset_seconds": 9.0, "end_offset_seconds": 12.0 }),
+                json!({ "source_sequence": 5, "start_offset_seconds": 12.0, "end_offset_seconds": 15.0 }),
+                json!({ "source_sequence": 6, "start_offset_seconds": 15.0, "end_offset_seconds": 18.0 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn request_defines_the_exact_clip_relative_evidence_contract() {
+        let body = build_request_body(DEFAULT_LUNA_MODEL, &complete_input(), None).unwrap();
+        let instructions = body["instructions"].as_str().unwrap();
+        assert!(instructions.contains("clip-relative seconds_from_clip_start"));
+        assert!(instructions.contains("exact matching source_segment_sequence"));
+        assert!(instructions.contains("[start_offset_seconds, end_offset_seconds)"));
+
+        let evidence = &body["text"]["format"]["schema"]["properties"]["actions"]["items"]["properties"]
+            ["evidence_timestamps"]["items"]["properties"];
+        let timestamp_description = evidence["seconds_from_clip_start"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(timestamp_description.contains("clip-relative"));
+        assert!(timestamp_description.contains("start_offset_seconds"));
+        let sequence_description = evidence["source_segment_sequence"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(sequence_description.contains("exactly match"));
+        assert!(sequence_description.contains("source_sequence"));
+    }
+
+    #[test]
     fn evidence_must_time_align_with_its_claimed_nonconsecutive_source_segment() {
         let mut input = complete_input();
         input.clip.started_at = at(3);
@@ -3061,6 +3201,28 @@ mod tests {
 
         assert_eq!(parse(12.0, 3).actions.len(), 1);
         assert!(parse(12.0, 2).actions.is_empty());
+    }
+
+    #[test]
+    fn evidence_source_ownership_does_not_round_across_a_chunk_boundary() {
+        let input = complete_input();
+        let parse = |seconds: f64, sequence: u64| {
+            let mut action = place_entry("BUY");
+            action["evidence_timestamps"] = json!([{
+                "seconds_from_clip_start": seconds,
+                "source": "TRANSCRIPT",
+                "source_segment_sequence": sequence
+            }]);
+            parse_and_validate_output(&output_with_action(action), &input).unwrap()
+        };
+
+        let rejected = parse(8.9996, 3);
+        assert!(rejected.actions.is_empty());
+        assert!(rejected.rejected_actions[0].action.event_id.is_none());
+
+        let accepted = parse(9.0, 3);
+        assert_eq!(accepted.actions.len(), 1);
+        assert!(accepted.actions[0].event_id.is_some());
     }
 
     fn rolling_context_json() -> Value {
@@ -3620,7 +3782,7 @@ mod tests {
         assert_eq!(body["model"], DEFAULT_LUNA_MODEL);
         assert_eq!(body["store"], false);
         assert_eq!(body["service_tier"], "fast");
-        assert_eq!(body["prompt_cache_key"], "observer-paper-luna-v1");
+        assert_eq!(body["prompt_cache_key"], "observer-paper-luna-v2");
         assert_eq!(body["reasoning"]["effort"], "low");
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["input"][0]["role"], "user");

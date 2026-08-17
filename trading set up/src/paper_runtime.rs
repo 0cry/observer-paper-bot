@@ -440,6 +440,10 @@ async fn run_internal(
         ..SessionView::default()
     };
     let mut health = initial_health();
+    if let Some(handle) = shared_dashboard.as_ref() {
+        let shared_health = handle.snapshot().await.health;
+        seed_shared_discovery_health(&mut health, &shared_health);
+    }
     let initial_dashboard_state = DashboardState {
         session: session_view.clone(),
         health: health.clone(),
@@ -1664,8 +1668,19 @@ async fn run_internal(
 }
 
 fn apply_live_start_status(state: &mut DashboardState, session: SessionView, health: HealthView) {
+    let discovery = (!state.health.youtube_discovery.status.is_empty())
+        .then(|| state.health.youtube_discovery.clone());
     state.session = session;
     state.health = health;
+    if let Some(discovery) = discovery {
+        state.health.youtube_discovery = discovery;
+    }
+}
+
+fn seed_shared_discovery_health(runtime: &mut HealthView, shared: &HealthView) {
+    if !shared.youtube_discovery.status.is_empty() {
+        runtime.youtube_discovery = shared.youtube_discovery.clone();
+    }
 }
 
 async fn save_neon_runtime(
@@ -3631,6 +3646,10 @@ fn drawdown(points: &[EquityPoint]) -> (f64, f64) {
 fn initial_health() -> HealthView {
     HealthView {
         overall: "STARTING".to_owned(),
+        youtube_discovery: component(
+            "DIRECT_STREAM_URL",
+            "runtime received a stream URL; capture will verify playback",
+        ),
         stream_capture: component("STARTING", "initializing live-edge capture"),
         transcription: component("STARTING", "loading Scribe v2 credentials"),
         analysis: component("STARTING", "initializing strict multimodal client"),
@@ -4014,6 +4033,51 @@ mod tests {
         assert_eq!(state.health.overall, "STARTING");
         assert_eq!(state.accounts.len(), 1);
         assert_eq!(state.history.len(), 1);
+    }
+
+    #[test]
+    fn direct_runtime_start_does_not_claim_official_live_discovery() {
+        let health = initial_health();
+        assert_eq!(health.youtube_discovery.status, "DIRECT_STREAM_URL");
+        assert!(!health.youtube_discovery.message.contains("confirmed"));
+    }
+
+    #[test]
+    fn shared_runtime_start_preserves_scheduler_discovery_proof() {
+        let mut state = DashboardState::empty();
+        state.health.youtube_discovery = component(
+            "LIVE_FOUND",
+            "Official YouTube Data API confirmed an active live broadcast",
+        );
+
+        apply_live_start_status(
+            &mut state,
+            SessionView {
+                status: "STARTING".to_owned(),
+                ..SessionView::default()
+            },
+            initial_health(),
+        );
+
+        assert_eq!(state.health.youtube_discovery.status, "LIVE_FOUND");
+    }
+
+    #[test]
+    fn shared_runtime_seeds_mutable_health_for_later_replacements() {
+        let scheduler_health = HealthView {
+            youtube_discovery: component(
+                "LIVE_FOUND",
+                "Official YouTube Data API confirmed an active live broadcast",
+            ),
+            ..HealthView::default()
+        };
+        let mut runtime_health = initial_health();
+
+        seed_shared_discovery_health(&mut runtime_health, &scheduler_health);
+
+        let mut later_snapshot = DashboardState::empty();
+        later_snapshot.health = runtime_health;
+        assert_eq!(later_snapshot.health.youtube_discovery.status, "LIVE_FOUND");
     }
 
     #[test]

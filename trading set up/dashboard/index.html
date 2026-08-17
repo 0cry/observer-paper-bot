@@ -42,6 +42,7 @@
         <ul>
           <li><span><i class="status-dot is-muted" id="api-dot"></i>Dashboard API</span></li>
           <li><span><i class="status-dot is-muted" id="feed-dot"></i>Market feed</span></li>
+          <li><span><i class="status-dot is-muted" id="youtube-discovery-dot"></i>YouTube discovery</span></li>
           <li><span><i class="status-dot is-muted" id="stream-dot"></i>Video stream</span></li>
           <li><span><i class="status-dot is-muted" id="stt-dot"></i>Transcription</span></li>
           <li><span><i class="status-dot is-muted" id="luna-dot"></i>OpenAI / Luna</span></li>
@@ -291,6 +292,17 @@
             <div class="cron-key-actions"><button class="quiet-button" type="button" id="runtime-key-clear">Clear all slots</button><button class="secondary-button" type="submit">Load into RAM</button></div>
           </form>
           <div class="history-stats" id="runtime-key-health" aria-live="polite">No runtime keys loaded.</div>
+        </article>
+
+        <article class="panel cron-key-panel">
+          <header class="panel-header"><div><h3>YouTube live discovery key</h3><p>One YouTube Data API key stays only in process RAM. Submitting a new key replaces the old key; its value is never shown.</p></div><span class="panel-count" id="youtube-key-state">Key required</span></header>
+          <div class="runtime-slots" aria-label="YouTube API runtime key slot">
+            <div class="runtime-slot"><i></i><span>Discovery slot</span><b id="youtube-key-slot">Empty</b></div>
+          </div>
+          <form class="cron-key-form" id="youtube-key-form">
+            <label><span class="sr-only">YouTube Data API key</span><input id="youtube-key-input" type="password" maxlength="512" placeholder="Paste one YouTube Data API key" autocomplete="off" spellcheck="false" required></label>
+            <div class="cron-key-actions"><button class="quiet-button" type="button" id="youtube-key-clear">Clear slot</button><button class="secondary-button" type="submit">Load into RAM</button></div>
+          </form>
         </article>
 
         <div class="cron-health-grid" aria-label="Cron health summary">

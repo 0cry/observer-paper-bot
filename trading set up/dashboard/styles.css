@@ -884,13 +884,17 @@ td strong { color: var(--text); font-size: 11px; font-weight: 650; }
 #cron-view .runtime-slot b { color: var(--text-soft); font-family: var(--font-mono); font-size: 8px; font-weight: 600; text-transform: uppercase; }
 #cron-view .runtime-slot.is-ready { border-color: rgba(39, 213, 155, .25); }
 #cron-view .runtime-slot.is-ready i { background: var(--green); box-shadow: 0 0 8px rgba(39, 213, 155, .5); }
-#cron-view #runtime-key-form {
+#cron-view .runtime-slot.is-pending { border-color: rgba(255, 191, 77, .3); }
+#cron-view .runtime-slot.is-pending i { background: var(--amber); box-shadow: 0 0 8px rgba(255, 191, 77, .45); }
+#cron-view #runtime-key-form,
+#cron-view #youtube-key-form {
   display: grid;
   grid-template-columns: 1fr;
   gap: 8px;
   padding: 10px 13px 4px;
 }
-#cron-view #runtime-key-form textarea {
+#cron-view #runtime-key-form textarea,
+#cron-view #youtube-key-form input {
   width: 100%;
   min-height: 68px;
   padding: 9px 10px;
@@ -903,7 +907,8 @@ td strong { color: var(--text); font-size: 11px; font-weight: 650; }
   font-family: var(--font-mono);
   font-size: 10px;
 }
-#cron-view #runtime-key-form textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(92, 141, 255, .1); }
+#cron-view #runtime-key-form textarea:focus,
+#cron-view #youtube-key-form input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(92, 141, 255, .1); }
 #cron-view .cron-key-actions { display: flex; justify-content: flex-end; gap: 7px; }
 #cron-view .history-stats { padding: 7px 13px 12px; }
 #cron-view .cron-health-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px; }

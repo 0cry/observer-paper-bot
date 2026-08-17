@@ -9,6 +9,9 @@
     runtimeKeys: "/api/llm/keys",
     runtimeKeysClear: "/api/llm/keys/clear",
     runtimeKeyHealth: "/api/llm/keys/health",
+    youtubeKey: "/api/youtube/key",
+    youtubeKeyClear: "/api/youtube/key/clear",
+    youtubeKeyHealth: "/api/youtube/key/health",
     cronJobs: "/api/cron/jobs",
   });
 
@@ -51,7 +54,7 @@
       analyticsError: false,
       hoverIndex: null,
     },
-    cron: { jobs: [], vault: null },
+    cron: { jobs: [], vault: null, youtubeVault: null },
   };
 
   const INR = new Intl.NumberFormat("en-IN", {
@@ -801,18 +804,30 @@
   }
 
   async function loadCron({ quiet = false } = {}) {
+    const [jobs, vault] = await Promise.allSettled([
+      requestJson(API.cronJobs, { timeout: 8500 }),
+      requestJson(API.runtimeKeyHealth, { timeout: 6500 }),
+    ]);
+    if (jobs.status === "fulfilled") app.cron.jobs = list(jobs.value);
+    if (vault.status === "fulfilled") app.cron.vault = unwrap(vault.value);
+    const anySucceeded = jobs.status === "fulfilled" || vault.status === "fulfilled";
+    if (anySucceeded) markApiSuccess(); else markApiFailure();
+    if (!quiet && (jobs.status === "rejected" || vault.status === "rejected")) {
+      showToast("Cron or runtime-key storage is unavailable.");
+    }
+    renderCron();
+    return jobs.status === "fulfilled" && vault.status === "fulfilled";
+  }
+
+  async function loadYouTubeVaultHealth({ quiet = false } = {}) {
     try {
-      const [jobs, vault] = await Promise.all([
-        requestJson(API.cronJobs, { timeout: 8500 }),
-        requestJson(API.runtimeKeyHealth, { timeout: 6500 }),
-      ]);
-      app.cron.jobs = list(jobs);
-      app.cron.vault = unwrap(vault);
+      app.cron.youtubeVault = unwrap(await requestJson(API.youtubeKeyHealth, { timeout: 6500 }));
       markApiSuccess();
       renderCron();
-    } catch (error) {
-      if (!quiet) showToast("Cron or runtime-key storage is unavailable.");
-      renderCron();
+      return true;
+    } catch {
+      if (!quiet && app.view === "cron") showToast("YouTube key health is unavailable.");
+      return false;
     }
   }
 
@@ -854,6 +869,15 @@
       els[`runtime-slot-${slotNumber}`].textContent = slotState;
       els[`runtime-slot-${slotNumber}`].closest(".runtime-slot")?.classList.toggle("is-ready", /ready|healthy|available/i.test(slotState));
     }
+    const youtubeVault = app.cron.youtubeVault || {};
+    const youtubeLoaded = number(youtubeVault.loaded_slots, 0);
+    const youtubeState = cleanText(youtubeVault.state, "KEY_REQUIRED").replaceAll("_", " ");
+    const youtubeReady = youtubeLoaded === 1 && /^ready$/i.test(youtubeState);
+    const youtubePending = youtubeLoaded === 1 && /^loaded$/i.test(youtubeState);
+    els["youtube-key-state"].textContent = youtubeState;
+    els["youtube-key-slot"].textContent = youtubeLoaded === 0 ? "Empty" : youtubeState;
+    els["youtube-key-slot"].closest(".runtime-slot")?.classList.toggle("is-ready", youtubeReady);
+    els["youtube-key-slot"].closest(".runtime-slot")?.classList.toggle("is-pending", youtubePending);
     const jobs = app.cron.jobs || [];
     const activeJobs = jobs.filter((job) => Boolean(job.enabled));
     const failedJobs = activeJobs.filter((job) => Boolean(job.last_error) || number(job.last_http_status) >= 400 || /fail|error/i.test(cleanText(job.last_status, "")));
@@ -903,6 +927,30 @@
       showToast("All runtime key slots cleared.");
       await loadCron({ quiet: true });
     } catch { showToast("Unable to clear runtime keys."); }
+  }
+
+  async function submitYouTubeKey(event) {
+    event.preventDefault();
+    const key = String(els["youtube-key-input"].value || "").trim();
+    if (!key) { showToast("Paste one YouTube Data API key."); return; }
+    try {
+      await requestJson(API.youtubeKey, { method: "POST", body: { key } });
+      els["youtube-key-input"].value = "";
+      showToast("YouTube discovery key loaded into RAM only.");
+      await loadYouTubeVaultHealth({ quiet: true });
+    } catch {
+      els["youtube-key-input"].value = "";
+      showToast("YouTube discovery key was not accepted.");
+    }
+  }
+
+  async function clearYouTubeKey() {
+    try {
+      await requestJson(API.youtubeKeyClear, { method: "POST", body: {} });
+      els["youtube-key-input"].value = "";
+      showToast("YouTube discovery key slot cleared.");
+      await loadYouTubeVaultHealth({ quiet: true });
+    } catch { showToast("Unable to clear YouTube discovery key."); }
   }
 
   async function submitCronJob(event) {
@@ -994,10 +1042,12 @@
   function statusPresentation(value, detail) {
     if (value === undefined || value === null) return { className: "is-muted", label: "Unknown" };
     const lower = String(value).toLowerCase();
-    if (boolean(value, false) || ["running", "active", "success", "synced"].includes(lower)) {
+    const healthy = ["running", "active", "success", "synced", "live_found", "fallback_live_found", "ready", "healthy"];
+    if (boolean(value, false) || healthy.includes(lower)) {
       return { className: "is-good", label: detail || (lower === "true" ? "Online" : cleanText(value, "Online")) };
     }
-    if (["starting", "connecting", "degraded", "stale", "waiting", "idle", "warning"].some((word) => lower.includes(word))) return { className: "is-warn", label: detail || cleanText(value, "Waiting") };
+    const pending = ["direct_stream_url", "not_live", "not_yet_confirmed", "key_required", "key_loaded", "loaded", "quota", "rate_limited"];
+    if (pending.includes(lower) || ["starting", "connecting", "checking", "degraded", "stale", "waiting", "idle", "warning"].some((word) => lower.includes(word))) return { className: "is-warn", label: detail || cleanText(value, "Waiting") };
     return { className: "is-bad", label: detail || (lower === "false" ? "Offline" : cleanText(value, "Offline")) };
   }
 
@@ -1014,6 +1064,7 @@
   function renderHealth() {
     setSourceStatus("api", app.apiOnline ? { className: "is-good", label: "Online" } : { className: "is-bad", label: "Offline" });
     setSourceStatus("feed", componentStatus("feed", ["market", "market_feed", "indstocks"]));
+    setSourceStatus("youtube-discovery", componentStatus("youtube_discovery", ["discovery"]));
     setSourceStatus("stream", componentStatus("stream", ["video", "youtube"]));
     setSourceStatus("stt", componentStatus("stt", ["transcription", "elevenlabs"]));
     setSourceStatus("luna", componentStatus("analysis", ["llm", "ai"]));
@@ -1570,7 +1621,10 @@
       loadHistory({ quiet: Boolean(app.history.trades.length) }),
       loadHistoryAnalytics({ quiet: Boolean(app.history.analyticsPoints.length) }),
     ]);
-    else if (name === "cron") loadCron({ quiet: Boolean(app.cron.vault) });
+    else if (name === "cron") Promise.allSettled([
+      loadCron({ quiet: Boolean(app.cron.vault) }),
+      loadYouTubeVaultHealth({ quiet: Boolean(app.cron.youtubeVault) }),
+    ]);
     else window.requestAnimationFrame(() => drawChart(modeData().curve));
   }
 
@@ -1597,7 +1651,7 @@
     els["refresh-button"].disabled = true;
     const tasks = [loadState(), loadHealth({ quiet: true })];
     if (app.view === "history") tasks.push(loadHistory({ quiet: true }), loadHistoryAnalytics({ quiet: true, force: true }));
-    else if (app.view === "cron") tasks.push(loadCron({ quiet: true }));
+    else if (app.view === "cron") tasks.push(loadCron({ quiet: true }), loadYouTubeVaultHealth({ quiet: true }));
     Promise.allSettled(tasks)
       .finally(() => { els["refresh-button"].disabled = false; });
   }
@@ -1642,6 +1696,8 @@
     els["history-filters"].addEventListener("reset", () => window.setTimeout(refreshHistoryFilters, 0));
     els["runtime-key-form"].addEventListener("submit", submitRuntimeKeys);
     els["runtime-key-clear"].addEventListener("click", clearRuntimeKeys);
+    els["youtube-key-form"].addEventListener("submit", submitYouTubeKey);
+    els["youtube-key-clear"].addEventListener("click", clearYouTubeKey);
     document.querySelectorAll("[data-cron-preset]").forEach((button) => button.addEventListener("click", () => applyCronPreset(button.dataset.cronPreset)));
     els["cron-job-form"].addEventListener("submit", submitCronJob);
     els["cron-jobs-body"].addEventListener("click", handleCronControls);
@@ -1712,9 +1768,15 @@
     tickClock();
     window.setInterval(tickClock, 1000);
     connectEvents();
-    await Promise.allSettled([loadState(), loadHealth({ quiet: true }), loadCron({ quiet: true })]);
+    await Promise.allSettled([
+      loadState(),
+      loadHealth({ quiet: true }),
+      loadCron({ quiet: true }),
+      loadYouTubeVaultHealth({ quiet: true }),
+    ]);
     window.setInterval(() => loadState({ quiet: true }), 4000);
     window.setInterval(() => loadHealth({ quiet: true }), 12000);
+    window.setInterval(() => loadYouTubeVaultHealth({ quiet: true }), 15_000);
   }
 
   document.addEventListener("DOMContentLoaded", init);

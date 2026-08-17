@@ -39,7 +39,12 @@ use tokio::{
     sync::{RwLock, broadcast},
 };
 
-use crate::{analysis::RuntimeKeyVault, cron_jobs, neon::NeonStore};
+use crate::{
+    analysis::RuntimeKeyVault,
+    cron_jobs,
+    neon::NeonStore,
+    youtube::{YouTubeKeyVault, YouTubeVaultHealth, YouTubeVaultState},
+};
 
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8787;
 pub const MAX_RECENT_SIGNALS: usize = 500;
@@ -121,6 +126,8 @@ pub struct SessionView {
 #[serde(default)]
 pub struct HealthView {
     pub overall: String,
+    /// Official YouTube Data API discovery state, separate from media capture.
+    pub youtube_discovery: ComponentHealth,
     #[serde(rename = "stream", alias = "stream_capture")]
     pub stream_capture: ComponentHealth,
     pub transcription: ComponentHealth,
@@ -380,6 +387,7 @@ pub struct DashboardHandle {
     server_started: Instant,
     sse_clients: Arc<AtomicUsize>,
     openai_vault: Arc<RuntimeKeyVault>,
+    youtube_vault: Arc<YouTubeKeyVault>,
     cron_store: Option<NeonStore>,
 }
 
@@ -396,6 +404,7 @@ impl DashboardHandle {
             server_started: Instant::now(),
             sse_clients: Arc::new(AtomicUsize::new(0)),
             openai_vault: Arc::new(RuntimeKeyVault::empty()),
+            youtube_vault: Arc::new(YouTubeKeyVault::empty()),
             cron_store: None,
         }
     }
@@ -414,6 +423,11 @@ impl DashboardHandle {
     /// is process-local and exposes no method to read raw credentials.
     pub fn openai_vault(&self) -> Arc<RuntimeKeyVault> {
         Arc::clone(&self.openai_vault)
+    }
+
+    /// The only application owner of the one-slot, RAM-only YouTube API key.
+    pub fn youtube_vault(&self) -> Arc<YouTubeKeyVault> {
+        Arc::clone(&self.youtube_vault)
     }
 
     pub fn with_cron_store(mut self, store: Option<NeonStore>) -> Self {
@@ -618,6 +632,9 @@ pub fn default_bind_address() -> SocketAddr {
 }
 
 pub fn router(handle: DashboardHandle) -> Router {
+    // By explicit product choice these one-way runtime key endpoints are
+    // public: any caller can replace or clear a slot, but no route can read a
+    // credential value. Keys remain process-local and disappear on restart.
     Router::new()
         .route("/", get(static_index))
         .route("/api/health", get(api_health))
@@ -629,6 +646,9 @@ pub fn router(handle: DashboardHandle) -> Router {
         .route("/api/llm/keys", post(api_add_llm_keys))
         .route("/api/llm/keys/clear", post(api_clear_llm_keys))
         .route("/api/llm/keys/health", get(api_llm_key_health))
+        .route("/api/youtube/key", post(api_add_youtube_key))
+        .route("/api/youtube/key/clear", post(api_clear_youtube_key))
+        .route("/api/youtube/key/health", get(api_youtube_key_health))
         .route(
             "/api/cron/jobs",
             get(api_list_cron_jobs).post(api_create_cron_job),
@@ -639,8 +659,8 @@ pub fn router(handle: DashboardHandle) -> Router {
         )
         .route("/api/cron/jobs/{id}/runs", get(api_list_cron_runs))
         .fallback(get(static_asset))
-        // The only credential-bearing request is a maximum of three runtime
-        // keys; a small body cap prevents accidental bulk submission.
+        // Credential-bearing requests are bounded runtime-only key payloads;
+        // a small body cap prevents accidental bulk submission.
         .layer(DefaultBodyLimit::max(4_096))
         .with_state(handle)
 }
@@ -718,6 +738,71 @@ async fn api_llm_key_health(
     State(handle): State<DashboardHandle>,
 ) -> Json<crate::analysis::VaultHealth> {
     Json(handle.openai_vault().health().await)
+}
+
+#[derive(Deserialize)]
+struct AddYouTubeKeyRequest {
+    key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct YouTubeKeyWriteResponse {
+    loaded_slots: usize,
+    state: YouTubeVaultState,
+}
+
+async fn api_add_youtube_key(
+    State(handle): State<DashboardHandle>,
+    AxumJson(request): AxumJson<AddYouTubeKeyRequest>,
+) -> Result<Json<YouTubeKeyWriteResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let vault = handle.youtube_vault();
+    vault.replace(&request.key).await.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"submitted key material was rejected"})),
+        )
+    })?;
+    let health = vault.health().await;
+    handle
+        .update("youtube_key_changed", None, |state| {
+            state.health.youtube_discovery = ComponentHealth {
+                status: "KEY_LOADED".to_owned(),
+                message: "YouTube Data API key loaded in process RAM; awaiting provider check"
+                    .to_owned(),
+                ..ComponentHealth::default()
+            };
+        })
+        .await;
+    Ok(Json(youtube_key_write_response(health)))
+}
+
+async fn api_clear_youtube_key(
+    State(handle): State<DashboardHandle>,
+) -> Json<YouTubeKeyWriteResponse> {
+    let vault = handle.youtube_vault();
+    vault.clear().await;
+    let health = vault.health().await;
+    handle
+        .update("youtube_key_cleared", None, |state| {
+            state.health.youtube_discovery = ComponentHealth {
+                status: "KEY_REQUIRED".to_owned(),
+                message: "add a YouTube Data API key in the dashboard".to_owned(),
+                ..ComponentHealth::default()
+            };
+        })
+        .await;
+    Json(youtube_key_write_response(health))
+}
+
+async fn api_youtube_key_health(State(handle): State<DashboardHandle>) -> Json<YouTubeVaultHealth> {
+    Json(handle.youtube_vault().health().await)
+}
+
+fn youtube_key_write_response(health: YouTubeVaultHealth) -> YouTubeKeyWriteResponse {
+    YouTubeKeyWriteResponse {
+        loaded_slots: health.loaded_slots,
+        state: health.state,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2229,5 +2314,77 @@ mod tests {
             handle.snapshot().await.health.analysis.status,
             "KEYS_REQUIRED"
         );
+    }
+
+    #[tokio::test]
+    async fn youtube_key_routes_replace_one_ram_slot_without_returning_the_secret() {
+        let handle = DashboardHandle::empty();
+        let first = api_add_youtube_key(
+            State(handle.clone()),
+            AxumJson(AddYouTubeKeyRequest {
+                key: "first-youtube-route-secret".to_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let second = api_add_youtube_key(
+            State(handle.clone()),
+            AxumJson(AddYouTubeKeyRequest {
+                key: "replacement-youtube-route-secret".to_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(first.loaded_slots, 1);
+        assert_eq!(second.loaded_slots, 1);
+        for payload in [
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap(),
+            serde_json::to_string(&api_youtube_key_health(State(handle.clone())).await.0).unwrap(),
+        ] {
+            assert!(!payload.contains("youtube-route-secret"));
+        }
+
+        let cleared = api_clear_youtube_key(State(handle.clone())).await.0;
+        assert_eq!(cleared.loaded_slots, 0);
+        assert_eq!(
+            cleared.state,
+            crate::youtube::YouTubeVaultState::KeyRequired
+        );
+    }
+
+    #[test]
+    fn dashboard_contains_one_way_youtube_api_key_controls() {
+        let html = include_str!("../dashboard/index.html");
+        let app = include_str!("../dashboard/app.js");
+        for required in [
+            "youtube-key-form",
+            "youtube-key-input",
+            "youtube-key-clear",
+            "youtube-key-state",
+        ] {
+            assert!(
+                html.contains(required),
+                "missing YouTube key control: {required}"
+            );
+        }
+        for required in [
+            "/api/youtube/key",
+            "/api/youtube/key/clear",
+            "/api/youtube/key/health",
+        ] {
+            assert!(
+                app.contains(required),
+                "missing YouTube key behavior: {required}"
+            );
+        }
+        assert!(
+            html.contains("youtube-discovery-dot"),
+            "discovery health must be distinct from capture health"
+        );
+        assert!(app.contains("componentStatus(\"youtube_discovery\""));
     }
 }

@@ -14,6 +14,7 @@ mod runtime_logs;
 mod scheduler;
 mod stt;
 mod trailing;
+mod youtube;
 
 use std::{
     collections::HashMap,
